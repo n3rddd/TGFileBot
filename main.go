@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	handleUrl "net/url"
 	"os"
@@ -162,7 +163,7 @@ func isDuplicateNotify(text string) bool {
 	}
 
 	if entry, exists := notifyDedupMap[key]; exists {
-		if now.Sub(entry.sentAt) < time.Minute {
+		if now.Sub(entry.sentAt) < 5*time.Minute {
 			return true // 重复
 		}
 	}
@@ -1364,6 +1365,29 @@ func timeFormat(seconds uint64) string {
 // HTTP 路由（基于 net/http）
 // ============================================================================
 
+// getClientIP 获取真实的客户端 IP
+func getClientIP(r *http.Request) string {
+	ip := r.Header.Get("X-Real-IP")
+	if ip == "" {
+		ip = r.Header.Get("X-Forwarded-For")
+	}
+	if ip == "" {
+		ip = r.RemoteAddr
+	}
+	// X-Forwarded-For 可能是逗号分隔的多个 IP，取第一个
+	if idx := strings.Index(ip, ","); idx != -1 {
+		ip = strings.TrimSpace(ip[:idx])
+	}
+	// 去除可能包含的端口号 (如 127.0.0.1:12345)
+	if strings.Contains(ip, ":") {
+		// 考虑到 IPv6 含有冒号，使用 net.SplitHostPort 更加健壮
+		if host, _, err := net.SplitHostPort(ip); err == nil {
+			ip = host
+		}
+	}
+	return ip
+}
+
 func setupRouter() http.Handler {
 	mux := http.NewServeMux()
 
@@ -1399,14 +1423,7 @@ func handleTGLink(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取访问者 IP
-	clientIP := r.Header.Get("X-Forwarded-For")
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
-	}
-	// 只取第一个 IP（可能有多个逗号分隔）
-	if idx := strings.Index(clientIP, ","); idx != -1 {
-		clientIP = strings.TrimSpace(clientIP[:idx])
-	}
+	clientIP := getClientIP(r)
 
 	targetLink := params.Get("link")
 

@@ -31,3 +31,11 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+.idea/vcs.xml
+.gitignore
+.idea/go.imports.xml
+.idea/modules.xml
+.idea/TGBot.iml
+files/blacklist.json
+files/fsb.session
+files/userbot.session

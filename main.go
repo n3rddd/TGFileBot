@@ -404,7 +404,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 func handleMess(m *telegram.NewMessage) error {
 	// 如果是用户发送或转发来的、带有图片/文档/视频的消息，直接生成直链
 	if m.IsMedia() && (m.Photo() != nil || m.Document() != nil || m.Video() != nil) {
-		link := fmt.Sprintf("%s:%d/stream?cid=%d&mid=%d&cate=bot", strings.TrimSuffix(infos.Conf.Site, "/"), infos.Conf.Port, m.ChatID(), m.ID)
+		link := fmt.Sprintf("%s/stream?cid=%d&mid=%d&cate=bot", strings.TrimSuffix(infos.Conf.Site, "/"), m.ChatID(), m.ID)
 		return sendLink(m, link)
 	}
 
@@ -469,7 +469,7 @@ func handleMess(m *telegram.NewMessage) error {
 		}
 
 		// 为媒体文件构造下载直链
-		link := fmt.Sprintf("%s:%d/stream?cid=%d&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), infos.Conf.Port, src.ChatID(), src.ID)
+		link := fmt.Sprintf("%s/stream?cid=%d&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID)
 		err = sendLink(m, link)
 		if err != nil {
 			log.Printf("推送直链失败: %+v", err)
@@ -686,9 +686,9 @@ func handleLink(w http.ResponseWriter, r *http.Request) {
 
 		// 为媒体文件构造下载直链
 		if infos.Conf.Password != "" {
-			link = fmt.Sprintf("%s:%d/stream?cid=%d&mid=%d&key=%s&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), infos.Conf.Port, src.ChatID(), src.ID, infos.Conf.Password)
+			link = fmt.Sprintf("%s/stream?cid=%d&mid=%d&key=%s&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID, infos.Conf.Password)
 		} else {
-			link = fmt.Sprintf("%s:%d/stream?cid=%d&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), infos.Conf.Port, src.ChatID(), src.ID)
+			link = fmt.Sprintf("%s/stream?cid=%d&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID)
 		}
 		http.Redirect(w, r, link, http.StatusFound)
 	}

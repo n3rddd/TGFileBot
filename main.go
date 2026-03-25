@@ -45,7 +45,7 @@ type Infos struct {
 
 var infos Infos
 var startTime time.Time
-var version = "v1.0.0"
+var version = "v1.0.1"
 
 func isAdmin(id int64) bool {
 	if id == infos.Conf.UserID {

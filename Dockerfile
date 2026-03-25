@@ -1,5 +1,5 @@
 # 构建阶段
-FROM golang:1.21-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 # 设置代理 (如果在国内环境，建议开启)
 # ENV GOPROXY=https://goproxy.cn,direct

@@ -598,11 +598,11 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// 获取消息内容 (增加一次重试逻辑，解决由于长时间闲置导致 Peer 缓存失效的问题)
 	ms, err := infos.Client.GetMessages(cid, &telegram.SearchOption{IDs: []int32{mid}})
-	if (err != nil || len(ms) == 0) && infos.UserClient != nil && cate != "bot" {
+	if err != nil || len(ms) == 0 {
 		log.Printf("首次获取消息失败，尝试刷新对话列表后重试: cid=%d, mid=%d, err=%v", cid, mid, err)
 		// 刷新一次对话列表（触发库内部自动解析 Entity 并更新 AccessHash 缓存）
-		if _, err := infos.UserClient.GetDialogs(&telegram.DialogOptions{Limit: 100}); err == nil {
-			ms, err = infos.UserClient.GetMessages(cid, &telegram.SearchOption{IDs: []int32{mid}})
+		if _, err := infos.Client.GetDialogs(&telegram.DialogOptions{Limit: 100}); err == nil {
+			ms, err = infos.Client.GetMessages(cid, &telegram.SearchOption{IDs: []int32{mid}})
 		}
 	}
 

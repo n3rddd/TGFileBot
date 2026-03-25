@@ -97,7 +97,7 @@ go run main.go -files 自定义目录
 ### 获取直链
 
 - **通过 Bot 转发/发送媒体文件**: 将 Telegram 中的图片、文档、视频等媒体文件转发或直接发送给 Bot，Bot 会自动回复直链。
-- **通过 Bot 发送 Telegram 链接**: 发送 `t.me/c/channel_id/message_id` 或 `t.me/username/message_id` 格式的链接给 Bot，Bot 会解析并回复直链。
+- **通过 Bot 发送 Telegram 链接**: 发送 `t.me/c/channel_id/message_id` 或 `t.me/username/message_id` 格式的链接给 Bot，Bot 会解析并回复直链，支持带 `comment` 参数的评论链接。
 - **通过 HTTP 接口**:
     - `GET /stream?cid=<chat_id>&mid=<message_id>&cate=<bot|user>&key=<password>`: 获取媒体文件流。
     - `GET /link?link=<telegram_link>&key=<password>`: 解析 Telegram 链接并重定向到直链。

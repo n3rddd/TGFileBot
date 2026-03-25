@@ -239,7 +239,13 @@ func (reader *Reader) fetchChunk(offset int64) (content []byte, err error) {
 				reader.ChannelID != 0 && reader.MessageID != 0 {
 
 				log.Printf("获取分片失败提示引用过期 (%d/3), 尝试刷新消息: %v", count+1, err)
+				if _, err := reader.Client.GetDialogs(&telegram.DialogOptions{Limit: 100}); err != nil {
+					log.Printf("刷新对话列表失败: %+v", err)
+					continue
+				}
+
 				if ms, err := reader.Client.GetMessages(reader.ChannelID, &telegram.SearchOption{IDs: []int32{reader.MessageID}}); err == nil && len(ms) > 0 {
+					log.Printf("成功获取消息进行刷新, 消息数量: %d", len(ms))
 					src := ms[0]
 					if src.IsMedia() {
 						if newLoc, newDC, _, _, err := telegram.GetFileLocation(src.Media(), telegram.FileLocationOptions{}); err == nil {
@@ -247,14 +253,20 @@ func (reader *Reader) fetchChunk(offset int64) (content []byte, err error) {
 							reader.Location = newLoc
 							reader.DC = newDC
 							reader.Mutex.Unlock()
-							log.Printf("成功刷新文件引用, DC: %d", newDC)
+							log.Printf("成功刷新文件引用, DC: %d, 新位置: %+v", newDC, newLoc)
 							time.Sleep(time.Second) // 稍作等待后重试一次
 							continue
+						} else {
+							log.Printf("从媒体刷新文件位置失败: %v", err)
 						}
+					} else {
+						log.Printf("获取到的消息不包含媒体内容, 无法刷新文件引用")
 					}
 				} else {
 					if err != nil {
 						log.Printf("刷新消息位置失败: %v", err)
+					} else {
+						log.Printf("刷新消息位置失败: 未找到消息或消息列表为空")
 					}
 				}
 			}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json" // 处理 JSON 数据
+	"errors"
 	"flag"          // 用于处理命令行参数
 	"fmt"           // 用于格式化字符串
 	"html"          // 用于转义 HTML 字符
@@ -36,6 +37,7 @@ type Infos struct {
 	Client     *telegram.Client         // 当前客户端实例
 	Mutex      *sync.Mutex              // 并发锁
 	Conf       *Conf                    // 全局配置指针
+	HasNew     bool                     // 是否有新配置
 	FilesPath  string                   // 配置目录路径
 	UserHash   string                   // 验证码所需的登录Hash
 	Senders    map[int]*mtproto.MTProto // 独立的 Bot 客户端
@@ -58,6 +60,12 @@ func isAdmin(id int64) bool {
 }
 
 func main() {
+	defer func() {
+		if err := saveConf(infos.Conf, infos.FilesPath); err != nil {
+			log.Printf("保存配置文件失败: %+v", err)
+		}
+	}()
+
 	startTime = time.Now()
 	// 加载配置文件
 	files := flag.String("files", "files", "文件路径和名称")
@@ -323,6 +331,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		}
 		infos.Mutex.Lock()
 		infos.Conf.WhiteIDs = append(infos.Conf.WhiteIDs, whiteID)
+		infos.HasNew = true
 		infos.Mutex.Unlock()
 		if _, err := m.Reply(fmt.Sprintf("添加白名单成功: %d", whiteID)); err != nil {
 			log.Printf("发送消息失败: %+v", err)
@@ -337,18 +346,43 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			return err
 		}
 		infos.Mutex.Lock()
+		oldLen := len(infos.Conf.WhiteIDs)
 		infos.Conf.WhiteIDs = slices.DeleteFunc(infos.Conf.WhiteIDs, func(num int64) bool {
 			return num == whiteID
 		})
+		newLen := len(infos.Conf.WhiteIDs)
 		infos.Mutex.Unlock()
-		if _, err := m.Reply(fmt.Sprintf("移除白名单成功: %d", whiteID)); err != nil {
-			log.Printf("发送消息失败: %+v", err)
+		if oldLen > newLen {
+			infos.Mutex.Lock()
+			infos.HasNew = true
+			infos.Mutex.Unlock()
+			if _, err := m.Reply(fmt.Sprintf("移除白名单成功: %d", whiteID)); err != nil {
+				log.Printf("发送消息失败: %+v", err)
+			}
+		} else {
+			if _, err := m.Reply(fmt.Sprintf("用户 %d 不在白名单中", whiteID)); err != nil {
+				log.Printf("发送消息失败: %+v", err)
+			}
 		}
 		return nil
 	case strings.HasPrefix(text, "/phone "):
+		content := strings.TrimSpace(strings.TrimPrefix(text, "/phone "))
+		if content == "" {
+			if _, err := m.Reply("手机不能为空"); err != nil {
+				log.Printf("发送消息失败: %+v", err)
+			}
+			return errors.New("手机不能为空")
+		}
+
+		if !strings.HasPrefix(content, "+") {
+			content = "+" + content
+		}
+
 		infos.Mutex.Lock()
-		infos.Conf.Phone = strings.TrimSpace(strings.TrimPrefix(text, "/phone "))
+		infos.Conf.Phone = content
+		infos.HasNew = true
 		infos.Mutex.Unlock()
+
 		if _, err := m.Reply(fmt.Sprintf("收到手机号 %s, 正在尝试发送验证码...", infos.Conf.Phone)); err != nil {
 			log.Printf("发送消息失败: %+v", err)
 		}
@@ -397,17 +431,8 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			infos.Mutex.Unlock()
 			return err
 		}
-
-		// 登录成功，更新配置并保存，因为设置了 SessionFile 也会一同持久化
-
-		if err := saveConf(infos.Conf, infos.FilesPath); err != nil {
-			if _, err := m.Reply("登录成功, 但保存配置失败: " + err.Error()); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
-		} else {
-			if _, err := m.Reply("登录成功"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+		if _, err := m.Reply("登录成功"); err != nil {
+			log.Printf("发送消息失败: %+v", err)
 		}
 		return initUserBot()
 	default:

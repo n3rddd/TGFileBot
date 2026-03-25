@@ -4,7 +4,7 @@ TGBot 是一个 Telegram Bot 和 UserBot 结合的项目，旨在提供文件直
 
 ## 功能特性
 
-- **文件直链分享**: 将 Telegram 中的媒体文件（图片、文档、视频）生成可直接访问的 HTTP 直链。
+- **文件直链分享**: 将 Telegram 中的媒体文件（图片、文档、视频、音频等）生成可直接访问的 HTTP 直链。
 - **媒体流式传输**: 支持通过 HTTP Range 请求对视频等媒体文件进行流式传输，实现边下边播。
 - **UserBot 管理**: 通过 Bot 客户端发送命令来管理 UserBot 的登录、白名单设置等。
 - **多管理员支持**: 支持配置多个管理员 ID，共同管理 Bot。
@@ -64,7 +64,7 @@ go mod tidy
 # 默认使用当前目录下的 files 文件夹
 go run main.go
 # 或者指定其它文件夹
-go run main.go -files my_config_dir
+go run main.go -files 自定义目录
 ```
 
 #### Docker 部署
@@ -109,3 +109,4 @@ go run main.go -files my_config_dir
 - 如果 UserBot 长时间未活动，可能会出现 Peer 缓存失效的问题，此时 Bot 会尝试刷新对话列表。
 - 确保您的服务器防火墙允许外部访问配置的 `port`。
 
+本项目遵循 MIT 许可 - 详见 [LICENSE](LICENSE)。

@@ -11,6 +11,7 @@ import (
 
 	mtproto "github.com/amarnathcjd/gogram"
 	"github.com/amarnathcjd/gogram/telegram"
+	"golang.org/x/sync/singleflight"
 )
 
 type Reader struct {
@@ -33,6 +34,7 @@ type Reader struct {
 	ReadBytes     int64
 	Once          sync.Once
 	Mutex         sync.Mutex
+	Refreshes     singleflight.Group
 }
 
 func (reader *Reader) Close() error {
@@ -126,7 +128,7 @@ func (reader *Reader) startFetching() {
 		}()
 
 		// Collector
-		pendingResults := make(map[int][]byte)
+		contents := make(map[int][]byte)
 		nextIndex := 0
 		for nextIndex < totalChunks {
 			select {
@@ -139,9 +141,9 @@ func (reader *Reader) startFetching() {
 					}
 					return
 				}
-				pendingResults[res.index] = res.content
+				contents[res.index] = res.content
 				for {
-					content, ok := pendingResults[nextIndex]
+					content, ok := contents[nextIndex]
 					if !ok {
 						break
 					}
@@ -180,7 +182,7 @@ func (reader *Reader) startFetching() {
 							return
 						}
 					}
-					delete(pendingResults, nextIndex)
+					delete(contents, nextIndex)
 					nextIndex++
 				}
 			case <-reader.Ctx.Done():
@@ -234,40 +236,16 @@ func (reader *Reader) fetchChunk(offset int64) (content []byte, err error) {
 		}
 
 		if err != nil {
-			// 如果是文件引用过期, 尝试通过消息 ID 重新获取位置
+			// 如果是文件引用过期, 通过 singleflight 合并并发刷新请求
 			if (strings.Contains(err.Error(), "FILE_REFERENCE") || strings.Contains(err.Error(), "EXPIRED")) &&
 				reader.ChannelID != 0 && reader.MessageID != 0 {
 
 				log.Printf("获取分片失败提示引用过期 (%d/3), 尝试刷新消息: %v", count+1, err)
-				if _, err := reader.Client.GetDialogs(&telegram.DialogOptions{Limit: 100}); err != nil {
-					log.Printf("刷新对话列表失败: %+v", err)
-					continue
-				}
-
-				if ms, err := reader.Client.GetMessages(reader.ChannelID, &telegram.SearchOption{IDs: []int32{reader.MessageID}}); err == nil && len(ms) > 0 {
-					log.Printf("成功获取消息进行刷新, 消息数量: %d", len(ms))
-					src := ms[0]
-					if src.IsMedia() {
-						if newLoc, newDC, _, _, err := telegram.GetFileLocation(src.Media(), telegram.FileLocationOptions{}); err == nil {
-							reader.Mutex.Lock()
-							reader.Location = newLoc
-							reader.DC = newDC
-							reader.Mutex.Unlock()
-							log.Printf("成功刷新文件引用, DC: %d, 新位置: %+v", newDC, newLoc)
-							time.Sleep(time.Second) // 稍作等待后重试一次
-							continue
-						} else {
-							log.Printf("从媒体刷新文件位置失败: %v", err)
-						}
-					} else {
-						log.Printf("获取到的消息不包含媒体内容, 无法刷新文件引用")
-					}
+				if _, err, _ := reader.Refreshes.Do("refresh", reader.refresh); err != nil {
+					log.Printf("刷新文件引用失败: %v", err)
 				} else {
-					if err != nil {
-						log.Printf("刷新消息位置失败: %v", err)
-					} else {
-						log.Printf("刷新消息位置失败: 未找到消息或消息列表为空")
-					}
+					time.Sleep(time.Second) // 稍作等待后重试
+					continue
 				}
 			}
 
@@ -282,6 +260,39 @@ func (reader *Reader) fetchChunk(offset int64) (content []byte, err error) {
 		return nil, fmt.Errorf("未知的响应类型: %T", res)
 	}
 	return nil, err
+}
+
+func (reader *Reader) refresh() (interface{}, error) {
+	/*
+		if _, err := reader.Client.GetDialogs(&telegram.DialogOptions{Limit: 100}); err != nil {
+			return nil, fmt.Errorf("刷新对话列表失败: %w", err)
+		}
+	*/
+
+	ms, err := reader.Client.GetMessages(reader.ChannelID, &telegram.SearchOption{IDs: []int32{reader.MessageID}})
+	if err != nil {
+		return nil, fmt.Errorf("刷新消息位置失败: %w", err)
+	}
+	if len(ms) == 0 {
+		return nil, fmt.Errorf("刷新消息位置失败: 未找到消息或消息列表为空")
+	}
+
+	src := ms[0]
+	if !src.IsMedia() {
+		return nil, fmt.Errorf("获取到的消息不包含媒体内容, 无法刷新文件引用")
+	}
+
+	newLoc, newDC, _, _, err := telegram.GetFileLocation(src.Media(), telegram.FileLocationOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("从媒体刷新文件位置失败: %w", err)
+	}
+
+	reader.Mutex.Lock()
+	reader.Location = newLoc
+	reader.DC = newDC
+	reader.Mutex.Unlock()
+	log.Printf("成功刷新文件引用, DC: %d, 新位置: %+v", newDC, newLoc)
+	return nil, nil
 }
 
 func (reader *Reader) Read(content []byte) (num int, err error) {

@@ -3,3 +3,5 @@ module tgfilebot
 go 1.25.0
 
 require github.com/amarnathcjd/gogram v1.7.2
+
+require golang.org/x/sync v0.20.0

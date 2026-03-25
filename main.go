@@ -445,7 +445,7 @@ func handleMess(m *telegram.NewMessage) error {
 	// 如果是用户发送或转发来的、带有图片/文档/视频的消息，直接生成直链
 	if m.IsMedia() && (m.Photo() != nil || m.Document() != nil || m.Video() != nil) {
 		link := fmt.Sprintf("%s/stream?cid=%d&mid=%d&cate=bot", strings.TrimSuffix(infos.Conf.Site, "/"), m.ChatID(), m.ID)
-		return sendLink(m, link)
+		return sendLink(link)
 	}
 
 	text := m.Text() // 获取文本内容
@@ -531,7 +531,7 @@ func handleMess(m *telegram.NewMessage) error {
 
 		// 为媒体文件构造下载直链
 		link := fmt.Sprintf("%s/stream?cid=%v&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID)
-		err = sendLink(m, link)
+		err = sendLink(link)
 		if err != nil {
 			log.Printf("推送直链失败: %+v", err)
 		}
@@ -793,7 +793,7 @@ func handleTime(seconds uint64) string {
 }
 
 // sendLink 发送美化后的下载链接消息
-func sendLink(m *telegram.NewMessage, link string) error {
+func sendLink(link string) error {
 	if infos.Conf.Password != "" {
 		link += fmt.Sprintf("&key=%s", infos.Conf.Password)
 	}
@@ -802,11 +802,11 @@ func sendLink(m *telegram.NewMessage, link string) error {
 		"🚀 直接下载", fmt.Sprintf("%s&download=true", link),
 	)
 
-	// 发送消息并设置解析模式为 HTML，附带内联键盘
-	_, err := m.Reply(text, &telegram.SendOptions{
+	_, err := infos.BotClient.SendMessage(infos.Conf.UserID, text, &telegram.SendOptions{
 		ParseMode:   "html",
 		ReplyMarkup: markup,
 	})
+
 	if err != nil {
 		log.Printf("发送下载链接失败: %+v", err)
 	}

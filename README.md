@@ -27,16 +27,28 @@ TGBot 是一个 Telegram Bot 和 UserBot 结合的项目，旨在提供文件直
 
 ```json
 {
-  "port": 8080,               // 程序运行的 HTTP 端口
-  "id": 0,                    // Telegram API ID
-  "hash": "",                 // Telegram API Hash
-  "site": "",                 // 反代域名，用于生成直链
-  "phone": "",                // User Bot 身份对应的手机号 (带国际区号，例如: +8613800138000)
-  "botToken": "",             // 接收/phone等命令的Bot Token
-  "password": "",             // 浏览器访问授权密码 (可选)
-  "userID": 0,                // User Bot 身份对应的账号ID (用于判断是否为管理员，建议填写UserBot的ID)
-  "adminIDs": [],             // 支持多管理员的ID列表 (填写Telegram用户ID)
-  "whiteIDs": []              // 支持多白名单的ID列表 (可选，用于限制/stream访问)
+  // 程序运行的 HTTP 端口
+  "port": 8080,
+  // Telegram API ID
+  "id": 0,
+  // Telegram API Hash
+  "hash": "",
+  // 反代域名，用于生成直链
+  "site": "",
+  // User Bot 身份对应的手机号 (带国际区号，例如: +8613800138000)
+  "phone": "",
+  // 接收/phone等命令的Bot Token
+  "botToken": "",
+  // 浏览器访问授权密码 (可选)
+  "password": "",
+  // User Bot 身份对应的账号ID (用于判断是否为管理员，建议填写UserBot的ID)
+  "userID": 0,
+  // 绑定的频道ID
+  "channelID": 0,
+  // 支持多管理员的ID列表 (填写Telegram用户ID)
+  "adminIDs": [],
+  // 支持多白名单的ID列表 (可选，用于限制/stream访问)
+  "whiteIDs": []
 }
 ```
 

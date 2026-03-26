@@ -188,7 +188,7 @@ func main() {
 		sigChan <- os.Interrupt
 	} else {
 		// 设置 HTTP 流式传输路由
-		http.HandleFunc("/stream", handleStream)
+		http.HandleFunc("/stream/", handleStream)
 		http.HandleFunc("/link", handleLink)
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/" {
@@ -571,13 +571,29 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 
 	cid, err := strconv.ParseInt(params.Get("cid"), 10, 64)
 	if err != nil || cid == 0 {
-		http.Error(w, "频道ID无效", http.StatusBadRequest)
-		return
+		if infos.Conf.ChannelID != 0 {
+			cid = infos.Conf.ChannelID
+		} else {
+			log.Printf("频道ID无效: %s", params.Get("cid"))
+			http.Error(w, "频道ID无效", http.StatusBadRequest)
+			return
+		}
 	}
+
 	value, err := strconv.ParseInt(params.Get("mid"), 10, 32)
 	if err != nil || value == 0 {
-		http.Error(w, "消息ID无效", http.StatusBadRequest)
-		return
+		re := regexp.MustCompile(`/stream/(\d+)/[a-zA-Z0-9]+`)
+		matches := re.FindStringSubmatch(r.URL.Path)
+		if len(matches) == 2 {
+			value, err = strconv.ParseInt(matches[1], 10, 32)
+			if err != nil || value == 0 {
+				http.Error(w, "消息ID无效", http.StatusBadRequest)
+				return
+			}
+		} else {
+			http.Error(w, "消息ID无效", http.StatusBadRequest)
+			return
+		}
 	}
 	mid := int32(value)
 

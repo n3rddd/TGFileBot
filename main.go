@@ -182,30 +182,21 @@ func main() {
 			sigChan <- os.Interrupt
 		}
 	}
-	// 设置 HTTP 流式传输路由
-	http.HandleFunc("/stream/", handleStream)
-	http.HandleFunc("/link", handleLink)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		resp := map[string]any{
-			"message": "服务器正在运行。",
-			"ok":      true,
-			"uptime":  handleTime(uint64(time.Since(startTime).Seconds())),
-			"version": version,
-		}
-		err = json.NewEncoder(w).Encode(resp)
-		if err != nil {
-			log.Printf("发送网页失败: %+v", err)
-		}
-	})
+
 	// 在协程中启动 HTTP 服务
 	go func() {
 		log.Printf("HTTP 服务运行在 %d 端口", infos.Conf.Port)
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", infos.Conf.Port), nil); err != nil {
+		server := &http.Server{
+			Addr:              fmt.Sprintf(":%d", infos.Conf.Port),
+			Handler:           http.HandlerFunc(handleMain),
+			ReadTimeout:       30 * time.Second,  // 读取请求超时
+			ReadHeaderTimeout: 10 * time.Second,  // 读取请求头超时
+			WriteTimeout:      60 * time.Second,  // 写入响应超时
+			IdleTimeout:       600 * time.Second, // 空闲连接超时
+			MaxHeaderBytes:    1 << 20,           // 1MB
+		}
+
+		if err := server.ListenAndServe(); err != nil {
 			log.Printf("HTTP 服务启动失败: %+v", err)
 			sigChan <- os.Interrupt
 		}
@@ -295,6 +286,37 @@ func initUserBot() error {
 
 	infos.UserClient.On(telegram.OnMessage, handleBotCommand)
 	return nil
+}
+
+func handleMain(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if path != "/" {
+		path = strings.TrimSuffix(path, "/")
+	}
+	switch {
+	case path == "/":
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		content := map[string]any{
+			"message": "服务器正在运行。",
+			"ok":      true,
+			"uptime":  handleTime(uint64(time.Since(startTime).Seconds())),
+			"version": version,
+		}
+		err := json.NewEncoder(w).Encode(content)
+		if err != nil {
+			log.Printf("发送网页失败: %+v", err)
+		}
+		return
+	case strings.HasPrefix(path, "/link"):
+		handleLink(w, r)
+		return
+	case strings.HasPrefix(path, "/stream"):
+		handleStream(w, r)
+		return
+	default:
+		http.NotFound(w, r)
+		return
+	}
 }
 
 func handlePhone() error {
@@ -822,7 +844,7 @@ func hackLink(matches [][]string, m *telegram.NewMessage) (links []string) {
 		}
 
 		// 为媒体文件构造下载直链
-		link := fmt.Sprintf("%s/stream?cid=%v&mid=%d&key=%s&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID, infos.Conf.Password)
+		link := fmt.Sprintf("%s/stream?cid=%v&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID, infos.Conf.Password)
 		if infos.Conf.Password != "" {
 			link += fmt.Sprintf("&key=%s", infos.Conf.Password)
 		}

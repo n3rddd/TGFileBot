@@ -17,6 +17,7 @@ type Conf struct {
 	Phone     string  `json:"phone"`              // User Bot 身份对应的手机号
 	BotToken  string  `json:"botToken"`           // 接收/phone等命令的Bot Token
 	Password  string  `json:"password,omitempty"` // 访问/link的密码
+	Workers   int     `json:"workers"`            // 并发数
 	UserID    int64   `json:"userID"`             // User Bot 身份对应的账号ID
 	ChannelID int64   `json:"channelID"`          // 频道ID
 	AdminIDs  []int64 `json:"adminIDs,omitempty"` // 支持多管理员的ID列表

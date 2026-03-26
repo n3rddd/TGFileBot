@@ -32,6 +32,8 @@ type Reader struct {
 	CurrBuffer    []byte
 	Pos           int
 	ReadBytes     int64
+	Refreshing    bool
+	Cond          *sync.Cond
 	Version       atomic.Int64
 	Once          sync.Once
 	Mutex         sync.Mutex
@@ -73,6 +75,7 @@ func newReader(
 		Cate:          cate,
 		Buffers:       make(chan []byte, 8), // Buffer up to 8MB
 		Errs:          make(chan error, 1),
+		Cond:          sync.NewCond(new(sync.Mutex)),
 	}
 	return reader
 }
@@ -81,7 +84,10 @@ func (reader *Reader) startFetching() {
 	go func() {
 		defer close(reader.Buffers)
 
-		workers := 4
+		workers := infos.Conf.Workers
+		if workers == 0 {
+			workers = 1
+		}
 		type task struct {
 			index  int
 			offset int64
@@ -195,6 +201,11 @@ func (reader *Reader) startFetching() {
 
 func (reader *Reader) fetchChunk(offset int64) (content []byte, err error) {
 	for count := 0; count < 3; count++ {
+		select {
+		case <-reader.Ctx.Done():
+			return nil, fmt.Errorf("canceled")
+		default:
+		}
 		reader.Mutex.Lock()
 		loc := reader.Location
 		version := reader.Version.Load()
@@ -215,23 +226,22 @@ func (reader *Reader) fetchChunk(offset int64) (content []byte, err error) {
 				infos.Senders = make(map[int]*mtproto.MTProto)
 			}
 			sender, ok := infos.Senders[targetDC]
-			infos.Mutex.Unlock()
 
 			if ok {
 				res, err = sender.MakeRequest(params)
+				infos.Mutex.Unlock()
 			} else {
 				// 尝试创建一个导出授权的 Sender
 				newSender, serr := reader.Client.CreateExportedSender(targetDC, false)
 				if serr == nil {
-					infos.Mutex.Lock()
 					infos.Senders[targetDC] = newSender
-					infos.Mutex.Unlock()
 					log.Printf("成功创建 DC %d 的导出 Sender", targetDC)
 					res, err = newSender.MakeRequest(params)
 				} else {
 					log.Printf("创建 DC %d 的导出 Sender 失败: %v, 将回退到主客户端", targetDC, serr)
 					res, err = reader.Client.UploadGetFile(params)
 				}
+				infos.Mutex.Unlock()
 			}
 		} else {
 			res, err = reader.Client.UploadGetFile(params)
@@ -242,9 +252,11 @@ func (reader *Reader) fetchChunk(offset int64) (content []byte, err error) {
 			if (strings.Contains(err.Error(), "FILE_REFERENCE") || strings.Contains(err.Error(), "EXPIRED")) &&
 				reader.ChannelID != 0 && reader.MessageID != 0 {
 				log.Printf("获取分片失败提示引用过期 (%d/3), 尝试刷新消息: %v", count+1, err)
-				if reader.refresh(version) {
-					// 刷新成功后, 等2秒让 Telegram 服务端真正生效新的 file reference
-					time.Sleep(2 * time.Second)
+				if refreshed, wait := reader.refresh(version); refreshed {
+					// 刷新成功或有其他 worker 刷新，等待指定时间后重试
+					if wait > 0 {
+						time.Sleep(wait)
+					}
 					continue
 				}
 			}
@@ -262,61 +274,81 @@ func (reader *Reader) fetchChunk(offset int64) (content []byte, err error) {
 	return nil, err
 }
 
-func (reader *Reader) refresh(version int64) bool {
+func (reader *Reader) refresh(version int64) (refreshed bool, waitDuration time.Duration) {
 	reader.Mutex.Lock()
-	defer reader.Mutex.Unlock()
+
+	// 如果别人正在刷新 → 等
+	for reader.Refreshing {
+		reader.Cond.Wait()
+	}
+
+	const cooldown = 8 * time.Second
 
 	currentVersion := reader.Version.Load()
 	if currentVersion > version {
-		// 其他 worker 已刷新, 但需要检查该刷新是否足够新
-		// 如果刷新发生在3秒以内, 说明刚刷新过但可能还没生效, 等一下再用
-		if time.Since(reader.LastRefresh) < 3*time.Second {
-			log.Printf("其他 worker 刚刷新过文件引用 (版本 %d -> %d, %v前), 等待生效后复用",
-				version, currentVersion, time.Since(reader.LastRefresh).Round(time.Millisecond))
-			// 在 mutex 外面等待, 释放锁让其他人也能读
-			return true
+		// 其他 worker 已刷新过；计算需要等待多久才能让新引用在 Telegram 服务端生效
+		elapsed := time.Since(reader.LastRefresh)
+		if elapsed < cooldown {
+			remaining := cooldown - elapsed
+			log.Printf("其他 worker 刚刷新过文件引用 (版本 %d -> %d, %v前), 等待 %v 后复用", version, currentVersion, elapsed.Round(time.Millisecond), remaining.Round(time.Millisecond))
+			reader.Mutex.Unlock()
+			return true, remaining
 		}
 		log.Printf("其他 worker 已刷新文件引用 (版本 %d -> %d), 直接复用", version, currentVersion)
-		return true
+		reader.Mutex.Unlock()
+		return true, 0
 	}
 
-	// 距上次刷新不足 3 秒，不再重复刷新（避免 Telegram 返回相同的过期引用）
-	if !reader.LastRefresh.IsZero() && time.Since(reader.LastRefresh) < 3*time.Second {
-		log.Printf("距离上次刷新仅 %v, 跳过本次刷新以避免获取到相同的过期引用",
-			time.Since(reader.LastRefresh).Round(time.Millisecond))
-		// 释放锁后等待一段时间再重试
-		return true
+	// 距上次刷新不足冷却时间，等剩余时间后再重试（避免拿到相同的过期引用）
+	if !reader.LastRefresh.IsZero() {
+		elapsed := time.Since(reader.LastRefresh)
+		if elapsed < cooldown {
+			remaining := cooldown - elapsed
+			log.Printf("距离上次刷新仅 %v, 等待 %v 后重试以避免获取到相同的过期引用", elapsed.Round(time.Millisecond), remaining.Round(time.Millisecond))
+			reader.Mutex.Unlock()
+			return true, remaining
+		}
 	}
+		
+	reader.Refreshing = true
+	reader.Mutex.Unlock()
 
 	ms, err := reader.Client.GetMessages(reader.ChannelID, &telegram.SearchOption{IDs: []int32{reader.MessageID}})
 	if err != nil {
 		log.Printf("刷新消息位置失败: %v", err)
-		return false
+		return false, 0
 	}
+
 	if len(ms) == 0 {
 		log.Printf("刷新消息位置失败: 未找到消息或消息列表为空")
-		return false
+		return false, 0
 	}
 
 	log.Printf("成功获取消息进行刷新, 消息数量: %d", len(ms))
 	src := ms[0]
 	if !src.IsMedia() {
 		log.Printf("获取到的消息不包含媒体内容, 无法刷新文件引用")
-		return false
+		return false, 0
 	}
 
 	newLoc, newDC, _, _, err := telegram.GetFileLocation(src.Media(), telegram.FileLocationOptions{})
 	if err != nil {
 		log.Printf("从媒体刷新文件位置失败: %v", err)
-		return false
+		return false, 0
 	}
 
+	reader.Mutex.Lock()
+	reader.Refreshing = false
 	reader.Location = newLoc
 	reader.DC = newDC
 	reader.Version.Add(1)
 	reader.LastRefresh = time.Now()
+	reader.Cond.Broadcast()
+	reader.Mutex.Unlock()
+	
 	log.Printf("成功刷新文件引用, DC: %d, 新位置: %+v", newDC, newLoc)
-	return true
+	// 等待冷却时间让新引用在 Telegram 服务端生效
+	return true, cooldown
 }
 
 func (reader *Reader) Read(content []byte) (num int, err error) {

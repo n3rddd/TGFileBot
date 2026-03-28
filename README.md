@@ -39,8 +39,6 @@ TGBot 是一个 Telegram Bot 和 UserBot 结合的项目，旨在提供文件直
   "hash": "",
   // 反代域名，用于生成直链
   "site": "",
-  // User Bot 身份对应的手机号 (带国际区号，例如: +8613800138000)
-  "phone": "",
   // 并发数
   "workers": 1,
   // 接收/phone等命令的Bot Token

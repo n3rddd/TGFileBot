@@ -40,29 +40,24 @@ type Infos struct {
 	HasNew     bool             // 是否有新配置
 	FilesPath  string           // 配置目录路径
 	FilePath   string           // 日志文件路径
+	File       *os.File         // 日志文件对象
 	Status     int              // 登录状态: 0 未登录, 1 验证码, 2 密码, 3 已登录
 	BotID      int64            // Bot 的 ID
 	Code       chan string      // 验证码
 	Pass       chan string      // 二次验证密码
-	//UserHash  string      // 验证码所需的登录Hash
 }
 
 var infos *Infos
 var startTime time.Time
-var version = "v1.0.1"
+var version = "v1.0.2"
 
 func newInfos(filePath, filesPath string) (*Infos, error) {
 	// 创建日志文件
+	filePath = filepath.Clean(filePath)
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Printf("无法打开日志文件: %v", err)
 	}
-
-	defer func() {
-		if err := file.Close(); err != nil {
-			log.Printf("关闭日志文件错误: %v", err)
-		}
-	}()
 
 	// 设置日志输出
 	multiWriter := io.MultiWriter(os.Stdout, file)
@@ -89,6 +84,7 @@ func newInfos(filePath, filesPath string) (*Infos, error) {
 	}
 
 	return &Infos{
+		File:      file,
 		FilePath:  filePath,
 		FilesPath: filesPath,
 		Conf:      conf,
@@ -104,7 +100,17 @@ func main() {
 	// 加载配置文件
 	files := flag.String("files", "files", "文件路径和名称")
 	file := flag.String("log", "files/log.log", "日志文件路径")
+	// 版本参数: -version 和 -v 指向同一个标志
+	var ver bool
+	flag.BoolVar(&ver, "version", false, "打印版本号并退出")
+	flag.BoolVar(&ver, "v", false, "打印版本号并退出 (shorthand)")
 	flag.Parse()
+
+	// 如果请求显示版本则直接输出并退出，避免初始化其他资源
+	if ver {
+		fmt.Println(version)
+		return
+	}
 
 	// 初始化
 	value, err := newInfos(*file, *files)
@@ -116,6 +122,9 @@ func main() {
 
 	// 退出时清理
 	defer func() {
+		if err := infos.File.Close(); err != nil {
+			log.Printf("关闭日志文件错误: %v", err)
+		}
 		if infos.BotClient != nil {
 			if err := infos.BotClient.Disconnect(); err != nil {
 				log.Printf("Bot 退出失败: %+v", err)
@@ -515,7 +524,6 @@ func (infos *Infos) resetStatus() {
 	infos.UserClient = nil
 	infos.Status = 0
 	infos.Mutex.Unlock()
-	return
 }
 
 func handleMain(w http.ResponseWriter, r *http.Request) {
@@ -551,18 +559,16 @@ func handleMain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 2. 打开日志文件
+		// 为每个请求打开一个新的文件句柄，避免并发读取冲突
 		file, err := os.Open(infos.FilePath)
 		if err != nil {
-			if _, err := fmt.Fprintf(w, "无法打开日志文件: %v\n", err); err != nil {
-				log.Printf("发送网页失败: %+v", err)
-			}
+			log.Printf("无法打开日志文件进行读取: %v", err)
+			http.Error(w, fmt.Sprintf("无法读取日志文件: %v", err), http.StatusInternalServerError)
 			return
 		}
 		defer func() {
-			err := file.Close()
-			if err != nil {
-				log.Printf("关闭日志文件错误: %v", err)
+			if err := file.Close(); err != nil {
+				log.Printf("关闭日志文件失败: %v", err)
 			}
 		}()
 

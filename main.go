@@ -1051,25 +1051,28 @@ func handleMediaCate(fileName string) string {
 func handleStream(w http.ResponseWriter, r *http.Request) {
 	// 获取 URL 传参
 	params := r.URL.Query()
-	password := params.Get("key")
-	if password != "" && infos.Conf.Password != "" && password != infos.Conf.Password {
-		http.Error(w, "无效的密码", http.StatusUnauthorized)
-		return
-	}
-
-	hash := params.Get("hash")
-	if hash != "" {
-		value := params.Get("uid")
-		uid, err := strconv.ParseInt(value, 10, 64)
-		if err == nil && uid != 0 {
-			if hash != infos.calculateHash(uid) {
+	if infos.Conf.Password != "" {
+		hash := params.Get("hash")
+		password := params.Get("key")
+		switch {
+		case password != "":
+			if password != infos.Conf.Password {
 				http.Error(w, "无效的密码", http.StatusUnauthorized)
 				return
 			}
-		} else {
-			log.Printf("UID无效: %s", value)
-			http.Error(w, "无效的密码", http.StatusUnauthorized)
-			return
+		case hash != "":
+			value := params.Get("uid")
+			uid, err := strconv.ParseInt(value, 10, 64)
+			if err == nil && uid != 0 {
+				if hash != infos.calculateHash(uid) {
+					http.Error(w, "无效的密码", http.StatusUnauthorized)
+					return
+				}
+			} else {
+				log.Printf("UID无效: %s", value)
+				http.Error(w, "无效的密码", http.StatusUnauthorized)
+				return
+			}
 		}
 	}
 
@@ -1227,30 +1230,33 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLink(w http.ResponseWriter, r *http.Request) {
+	res := HackLink{}
 	params := r.URL.Query()
-	password := params.Get("key")
-	if password != "" && infos.Conf.Password != "" && password != infos.Conf.Password {
-		http.Error(w, "无效的密码", http.StatusUnauthorized)
-		return
-	}
-	res := HackLink{
-		Pass: password,
-	}
-	hash := params.Get("hash")
-	if hash != "" {
-		res.Hash = hash
-		value := params.Get("uid")
-		uid, err := strconv.ParseInt(value, 10, 64)
-		if err == nil && uid != 0 {
-			res.UID = uid
-			if hash != infos.calculateHash(uid) {
+	if infos.Conf.Password != "" {
+		hash := params.Get("hash")
+		password := params.Get("key")
+		switch {
+		case password != "":
+			res.Pass = password
+			if password != infos.Conf.Password {
 				http.Error(w, "无效的密码", http.StatusUnauthorized)
 				return
 			}
-		} else {
-			log.Printf("UID无效: %s", value)
-			http.Error(w, "无效的密码", http.StatusUnauthorized)
-			return
+		case hash != "":
+			res.Hash = hash
+			value := params.Get("uid")
+			uid, err := strconv.ParseInt(value, 10, 64)
+			if err == nil && uid != 0 {
+				res.UID = uid
+				if hash != infos.calculateHash(uid) {
+					http.Error(w, "无效的密码", http.StatusUnauthorized)
+					return
+				}
+			} else {
+				log.Printf("UID无效: %s", value)
+				http.Error(w, "无效的密码", http.StatusUnauthorized)
+				return
+			}
 		}
 	}
 

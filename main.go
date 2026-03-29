@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"         // 用于读取文件流
+	"crypto/md5"    // 用于计算哈希值
+	"encoding/hex"  // 用于进行十六进制编码
 	"encoding/json" // 用于处理 JSON 数据
 	"errors"        // 用于处理错误
 	"flag"          // 用于处理命令行参数
@@ -38,6 +40,7 @@ type Infos struct {
 	Mutex      *sync.Mutex      // 并发锁
 	Conf       *Conf            // 全局配置指针
 	HasNew     bool             // 是否有新配置
+	Hash       string           // 配置密码的 6 位哈希值
 	FilesPath  string           // 配置目录路径
 	FilePath   string           // 日志文件路径
 	File       *os.File         // 日志文件对象
@@ -83,6 +86,7 @@ func newInfos(filePath, filesPath string) (*Infos, error) {
 		}
 	}
 
+
 	return &Infos{
 		File:      file,
 		FilePath:  filePath,
@@ -118,6 +122,11 @@ func main() {
 		return
 	}
 	infos = value
+	// 计算 Password 的 6 位 MD5 哈希值
+	if infos.Conf.Password != "" {
+		src := md5.Sum([]byte(infos.Conf.Password))
+		infos.Hash = hex.EncodeToString(src[:])[:6]
+	}
 
 	// 退出时清理
 	defer func() {
@@ -798,8 +807,8 @@ func handleMess(m *telegram.NewMessage) error {
 	// 如果是用户发送或转发来的、带有图片/文档/视频的消息, 直接生成直链
 	if m.IsMedia() && (m.Photo() != nil || m.Document() != nil || m.Video() != nil) {
 		link := fmt.Sprintf("%s/stream?cid=%d&mid=%d&cate=bot", strings.TrimSuffix(infos.Conf.Site, "/"), m.ChatID(), m.ID)
-		if infos.Conf.Password != "" {
-			link += fmt.Sprintf("&key=%s", infos.Conf.Password)
+		if infos.Hash != "" {
+			link += fmt.Sprintf("&hash=%s", infos.Hash)
 		}
 		return sendLink(m, link)
 	}
@@ -867,7 +876,12 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	// 获取 URL 传参
 	params := r.URL.Query()
 	password := params.Get("key")
-	if infos.Conf.Password != "" && password != infos.Conf.Password {
+	if password != "" && infos.Conf.Password != "" && password != infos.Conf.Password {
+		http.Error(w, "无效的密码", http.StatusUnauthorized)
+		return
+	}
+	hash := params.Get("hash")
+	if hash != "" && infos.Hash != "" && hash != infos.Hash {
 		http.Error(w, "无效的密码", http.StatusUnauthorized)
 		return
 	}
@@ -1029,7 +1043,12 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 func handleLink(w http.ResponseWriter, r *http.Request) {
 	params := r.URL.Query()
 	password := params.Get("key")
-	if infos.Conf.Password != "" && password != infos.Conf.Password {
+	if password != "" && infos.Conf.Password != "" && password != infos.Conf.Password {
+		http.Error(w, "无效的密码", http.StatusUnauthorized)
+		return
+	}
+	hash := params.Get("hash")
+	if hash != "" && infos.Hash != "" && hash != infos.Hash {
 		http.Error(w, "无效的密码", http.StatusUnauthorized)
 		return
 	}
@@ -1052,6 +1071,23 @@ func handleLink(w http.ResponseWriter, r *http.Request) {
 
 	http.Error(w, "未找到可下载的媒体", http.StatusNotFound)
 }
+
+func handleTime(seconds uint64) string {
+	days := seconds / 86400
+	hours := (seconds % 86400) / 3600
+	minutes := (seconds % 3600) / 60
+	secs := seconds % 60
+
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh %dm %ds", days, hours, minutes, secs)
+	} else if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, secs)
+	} else if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, secs)
+	}
+	return fmt.Sprintf("%ds", secs)
+}
+
 
 func hackLink(matches [][]string, m *telegram.NewMessage) (links []string) {
 	// 遍历所有匹配到的链接
@@ -1137,29 +1173,14 @@ func hackLink(matches [][]string, m *telegram.NewMessage) (links []string) {
 
 		// 为媒体文件构造下载直链
 		link := fmt.Sprintf("%s/stream?cid=%v&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID)
-		if infos.Conf.Password != "" {
-			link += fmt.Sprintf("&key=%s", infos.Conf.Password)
+		if infos.Hash != "" {
+			link += fmt.Sprintf("&hash=%s", infos.Hash)
 		}
 		links = append(links, link)
 	}
 	return links
 }
 
-func handleTime(seconds uint64) string {
-	days := seconds / 86400
-	hours := (seconds % 86400) / 3600
-	minutes := (seconds % 3600) / 60
-	secs := seconds % 60
-
-	if days > 0 {
-		return fmt.Sprintf("%dd %dh %dm %ds", days, hours, minutes, secs)
-	} else if hours > 0 {
-		return fmt.Sprintf("%dh %dm %ds", hours, minutes, secs)
-	} else if minutes > 0 {
-		return fmt.Sprintf("%dm %ds", minutes, secs)
-	}
-	return fmt.Sprintf("%ds", secs)
-}
 
 // sendLink 发送美化后的下载链接消息
 func sendLink(m *telegram.NewMessage, link string) error {

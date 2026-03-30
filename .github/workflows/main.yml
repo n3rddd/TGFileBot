@@ -36,6 +36,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WITH_V: false  # 不生成带v前缀的标签，如1.0.0而非v1.0.0
           
+      - name: Update Dependencies
+        run: |
+          go mod edit -dropreplace github.com/amarnathcjd/gogram
+          go mod edit -replace github.com/amarnathcjd/gogram=github.com/lm317379829/gogram@latest
+          go mod tidy
+
       - name: Build Go
         run: |
           set +e

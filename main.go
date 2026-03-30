@@ -477,11 +477,13 @@ func (infos *Infos) startUserBotQR() (err error) {
 			})
 			if err != nil {
 				log.Printf("获取 QR 登录失败: %+v", err)
-				if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, fmt.Sprintf("获取 QR 登录失败: %+v", err)); err != nil {
-					log.Printf("发送消息失败: %+v", err)
+				if !telegram.MatchError(err, "SESSION_PASSWORD_NEEDED]") {
+					if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, fmt.Sprintf("获取 QR 登录失败: %+v", err)); err != nil {
+						log.Printf("发送消息失败: %+v", err)
+					}
+					infos.resetStatus()
+					return
 				}
-				infos.resetStatus()
-				return
 			}
 
 			png, err := qr.ExportAsPng()
@@ -515,12 +517,14 @@ func (infos *Infos) startUserBotQR() (err error) {
 
 			err = qr.WaitLogin()
 			if err != nil {
-				log.Printf("QR 登录失败: %+v", err)
-				if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, fmt.Sprintf("QR 登录失败: %+v", err)); err != nil && infos.Status != 0 {
-					log.Printf("发送消息失败: %+v", err)
+				if !strings.Contains(err.Error(), "scanning again") {
+					log.Printf("QR 登录失败: %+v", err)
+					if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, fmt.Sprintf("QR 登录失败: %+v", err)); err != nil && infos.Status != 0 {
+						log.Printf("发送消息失败: %+v", err)
+					}
+					infos.resetStatus()
+					return
 				}
-				infos.resetStatus()
-				return
 			}
 
 			if err := infos.checkStatus(); err != nil {

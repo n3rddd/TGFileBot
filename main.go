@@ -821,7 +821,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		}
 		sendMS(m, "提交验证码成功", nil, 60)
 		return nil
-	case strings.HasPrefix(text, "/pass"):
+	case strings.HasPrefix(text, "/pass") && !strings.HasPrefix(text, "/password"):
 		if m.SenderID() != infos.Conf.UserID {
 			sendMS(m, "你没有使用此命令的权限", nil, 60)
 			return nil
@@ -846,7 +846,11 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		}
 		content := strings.TrimSpace(strings.TrimPrefix(text, "/dc"))
 		if content == "" {
-			sendMS(m, fmt.Sprintf("当前DC: %d", infos.Conf.DC), nil, 60)
+			if infos.Conf.DC != 0 {
+				sendMS(m, fmt.Sprintf("当前DC: %d", infos.Conf.DC), nil, 60)
+			} else {
+				sendMS(m, "当前未手动指定DC", nil, 60)
+			}
 			return nil
 		}
 		value, err := strconv.Atoi(content)

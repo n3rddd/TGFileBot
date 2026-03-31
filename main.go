@@ -26,42 +26,151 @@ import (
 	"github.com/amarnathcjd/gogram/telegram" // 导入 gogram 客户端核心库
 )
 
+// HackLink 结构体用于在处理提取链接时传递中间数据
 type HackLink struct {
-	M       *telegram.NewMessage
-	UID     int64
-	Pass    string
-	Hash    string
-	Matches [][]string
+	M       *telegram.NewMessage // 原始消息对象
+	UID     int64                // 发起请求的用户 ID
+	Pass    string               // 可选密码
+	Hash    string               // 验证哈希
+	Matches [][]string           // 正则匹配到的链接信息
 }
 
+// CleanRealm 结构体用于定义清理缓存和会话的范围
 type CleanRealm struct {
-	Filter bool   // 是否过滤
-	ID     string // 过滤ID
-	Cate   string // 过滤类型: bot 或者 user
-	Realm  string // 过滤范围: cache 或者 session
+	Filter bool   // 是否启用过滤，只删除特定 ID 以外的文件
+	ID     string // 过滤 ID（如账号 ID）
+	Cate   string // 类型：bot 或 user
+	Realm  string // 范围：cache 或 session
 }
 
+// Infos 结构体保存了程序运行时的全局状态和资源句柄
 type Infos struct {
-	BotClient  *telegram.Client // 独立的 Bot 客户端（可选）
-	UserClient *telegram.Client // 全局 Telegram 客户端实例
-	Client     *telegram.Client // 当前客户端实例
-	Mutex      *sync.Mutex      // 并发锁
-	Conf       *Conf            // 全局配置指针
-	HasNew     bool             // 是否有新配置
-	FilesPath  string           // 配置目录路径
+	BotClient  *telegram.Client // 独立的 Bot 客户端（用于与用户交互）
+	UserClient *telegram.Client // 全局 UserBot 客户端实例（用于读取私有内容和流式传输）
+	Client     *telegram.Client // 当前活跃客户端指针
+	Mutex      *sync.Mutex      // 全局互斥锁，保护并发安全
+	Conf       *Conf            // 指向全局配置
+	HasNew     bool             // 标记配置是否被动态修改需要持久化
+	FilesPath  string           // 配置文件存放目录
 	FilePath   string           // 日志文件路径
-	File       *os.File         // 日志文件对象
-	Status     int              // 登录状态: 0 未登录, 1 验证码, 2 密码, 3 已登录
-	BotID      int64            // Bot 的 ID
-	Code       chan string      // 验证码
-	Pass       chan string      // 二次验证密码
-	IDs        map[int64]string // 授权ID列表
-	Rex        *regexp.Regexp   // 正则表达式
+	File       *os.File         // 日志文件句柄
+	Status     int              // UserBot 登录状态: 0 未登录, 1 等待验证码, 2 等待二步验证, 3 已登录
+	BotID      int64            // Bot 自身的 ID
+	Code       chan string      // 用于接收异步提交的验证码
+	Pass       chan string      // 用于接收异步提交的二步验证密码
+	IDs        map[int64]string // 缓存用户 ID 到哈希的映射，减少重复计算
+	Rex        *regexp.Regexp   // 用于解析 Telegram FloodWait 错误的正则
 }
 
 var infos *Infos
 var startTime time.Time
 var version = "v1.0.4"
+
+// main 是程序的入口函数
+func main() {
+	startTime = time.Now()
+	// 解析命令行参数
+	files := flag.String("files", "files", "配置文件所属目录路径（包含 config.json, session 等）")
+	file := flag.String("log", "files/log.log", "日志文件的存放路径")
+	var ver bool
+	flag.BoolVar(&ver, "version", false, "显示程序版本号并退出")
+	flag.BoolVar(&ver, "v", false, "显示程序版本号并退出")
+	flag.Parse()
+
+	// 版本检查逻辑
+	if ver {
+		fmt.Println(version)
+		return
+	}
+
+	// 1. 初始化全局 Infos 对象并加载配置
+	value, err := newInfos(*file, *files)
+	if err != nil {
+		log.Printf("初始化失败: %+v", err)
+		return
+	}
+	infos = value
+
+	// 2. 退出时的资源清理（延迟执行）
+	defer func() {
+		if err := infos.File.Close(); err != nil {
+			log.Printf("关闭日志文件错误: %v", err)
+		}
+		if infos.BotClient != nil {
+			if err := infos.BotClient.Disconnect(); err != nil {
+				log.Printf("Bot 退出失败: %+v", err)
+			}
+		}
+		if infos.UserClient != nil {
+			if err := infos.UserClient.Disconnect(); err != nil {
+				log.Printf("UserBot 退出失败: %+v", err)
+			}
+		}
+	}()
+
+	// 3. 校验关键配置参数
+	if infos.Conf.AppID == 0 || infos.Conf.AppHash == "" || infos.Conf.BotToken == "" {
+		log.Panicf("配置文件缺少必要的参数: AppID、AppHash、BotToken")
+		return
+	}
+
+	if infos.Conf.Port == 0 {
+		infos.Conf.Port = 8080 // 默认端口 8080
+	}
+
+	// 4. 启动 Bot 客户端（用于接收管理指令和进行提取链接交互）
+	err = infos.startBot()
+	if err != nil {
+		return
+	}
+
+	// 5. 初始化 UserBot 客户端（此时只是连接，尚未完成登录流程）
+	err = infos.userBotClient()
+	if err != nil {
+		log.Printf("UserBot 启动失败: %+v", err)
+		return
+	}
+
+	// 忽略 SIGPIPE 信号，防止由于网络异常断开导致进程崩溃
+	signal.Ignore(syscall.SIGPIPE)
+
+	// 设置系统中断信号监听，用于优雅退出
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// 6. 在独立协程中启动 HTTP HTTP 服务
+	go func() {
+		log.Printf("HTTP 服务运行在 %d 端口", infos.Conf.Port)
+		server := &http.Server{
+			Addr:              fmt.Sprintf(":%d", infos.Conf.Port),
+			Handler:           http.HandlerFunc(handleMain), // 主路由处理函数
+			ReadTimeout:       30 * time.Second,             // 读取请求超时
+			ReadHeaderTimeout: 10 * time.Second,             // 读取请求头超时
+			WriteTimeout:      60 * time.Second,             // 写入响应超时
+			IdleTimeout:       600 * time.Second,            // 空闲连接超时
+			MaxHeaderBytes:    1 << 20,                      // 最大头部字节数 (1MB)
+		}
+
+		if err := server.ListenAndServe(); err != nil {
+			log.Printf("HTTP 服务启动失败: %+v", err)
+			sigChan <- os.Interrupt
+		}
+	}()
+
+	// 7. 发送程序启动通知（如果 Bot 已连接且有管理员配置）
+	sendMS(nil, "程序已启动", nil, 60)
+
+	// 8. 检查 UserBot 登录状态，尝试自动登录（若已存在 session）
+	if err := infos.checkStatus(); err != nil {
+		log.Printf("UserBot 登录失败: %+v", err)
+		infos.resetStatus()
+	}
+
+	// 阻塞等待直到接收到退出信号
+	sig := <-sigChan
+	log.Printf("收到信号: %v, 正在退出...", sig)
+	sendMS(nil, "程序已退出", nil, 60)
+}
 
 func newInfos(filePath, filesPath string) (*Infos, error) {
 	// 创建日志文件
@@ -109,112 +218,31 @@ func newInfos(filePath, filesPath string) (*Infos, error) {
 	}, nil
 }
 
-func main() {
-	startTime = time.Now()
-	// 加载配置文件
-	files := flag.String("files", "files", "文件路径和名称")
-	file := flag.String("log", "files/log.log", "日志文件路径")
-	var ver bool
-	flag.BoolVar(&ver, "version", false, "打印版本号并退出")
-	flag.BoolVar(&ver, "v", false, "打印版本号并退出")
-	flag.Parse()
-
-	// 如果请求显示版本则直接输出并退出，避免初始化其他资源
-	if ver {
-		fmt.Println(version)
-		return
-	}
-
-	// 初始化
-	value, err := newInfos(*file, *files)
-	if err != nil {
-		log.Printf("初始化失败: %+v", err)
-		return
-	}
-	infos = value
-
-	// 退出时清理
-	defer func() {
-		if err := infos.File.Close(); err != nil {
-			log.Printf("关闭日志文件错误: %v", err)
-		}
-		if infos.BotClient != nil {
-			if err := infos.BotClient.Disconnect(); err != nil {
-				log.Printf("Bot 退出失败: %+v", err)
+func botConf(cate string) (botConf telegram.ClientConfig) {
+	return telegram.ClientConfig{
+		AppID:        infos.Conf.AppID,
+		AppHash:      infos.Conf.AppHash,
+		LogLevel:     telegram.LogError,
+		Session:      filepath.Join(infos.FilesPath, fmt.Sprintf("%s.session", cate)),
+		Cache:        telegram.NewCache(filepath.Join(infos.FilesPath, fmt.Sprintf("%s.cache", cate))),
+		CacheSenders: true,
+		DeviceConfig: telegram.DeviceConfig{
+			DeviceModel:   "Android",
+			SystemVersion: "Android 14",
+			AppVersion:    "10.14.3",
+		},
+		FloodHandler: func(err error) bool {
+			wait := 3
+			matches := infos.Rex.FindStringSubmatch(strings.ToUpper(err.Error()))
+			if len(matches) > 1 {
+				if value, err := strconv.Atoi(matches[1]); err == nil {
+					wait = value
+				}
 			}
-		}
-		if infos.UserClient != nil {
-			if err := infos.UserClient.Disconnect(); err != nil {
-				log.Printf("UserBot 退出失败: %+v", err)
-			}
-		}
-	}()
-
-	if infos.Conf.AppID == 0 || infos.Conf.AppHash == "" || infos.Conf.BotToken == "" {
-		log.Panicf("配置文件缺少必要的参数: AppID、AppHash、BotToken")
-		return
-	}
-
-	if infos.Conf.Port == 0 {
-		infos.Conf.Port = 8080
-	}
-
-	// 启动 Bot
-	err = infos.startBot()
-	if err != nil {
-		return
-	}
-
-	// 启动 UserBot 客户端
-	err = infos.userBotClient()
-	if err != nil {
-		log.Printf("UserBot 启动失败: %+v", err)
-		return
-	}
-
-	// 忽略 SIGPIPE 信号
-	signal.Ignore(syscall.SIGPIPE)
-
-	// 创建信号通道
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	// 在协程中启动 HTTP 服务
-	go func() {
-		log.Printf("HTTP 服务运行在 %d 端口", infos.Conf.Port)
-		server := &http.Server{
-			Addr:              fmt.Sprintf(":%d", infos.Conf.Port),
-			Handler:           http.HandlerFunc(handleMain),
-			ReadTimeout:       30 * time.Second,  // 读取请求超时
-			ReadHeaderTimeout: 10 * time.Second,  // 读取请求头超时
-			WriteTimeout:      60 * time.Second,  // 写入响应超时
-			IdleTimeout:       600 * time.Second, // 空闲连接超时
-			MaxHeaderBytes:    1 << 20,           // 1MB
-		}
-
-		if err := server.ListenAndServe(); err != nil {
-			log.Printf("HTTP 服务启动失败: %+v", err)
-			sigChan <- os.Interrupt
-		}
-	}()
-
-	if infos.BotClient != nil {
-		if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, "程序已启动"); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
-		if err := infos.checkStatus(); err != nil {
-			log.Printf("UserBot 登录失败: %+v", err)
-			infos.resetStatus()
-		}
-	}
-
-	// 等待中断信号
-	sig := <-sigChan
-	log.Printf("收到信号: %v, 正在退出...", sig)
-	if infos.BotClient != nil {
-		if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, "程序已退出"); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
+			log.Printf("下载太过频繁, 等待 %d 秒后重试", wait)
+			time.Sleep(time.Duration(wait) * time.Second)
+			return true
+		},
 	}
 }
 
@@ -230,7 +258,7 @@ func (infos *Infos) isAdmin(id int64) bool {
 	return false
 }
 
-func (infos *Infos) isWhiteList(id int64) bool {
+func (infos *Infos) isWhite(id int64) bool {
 	for _, whiteID := range infos.Conf.WhiteIDs {
 		if id == whiteID {
 			return true
@@ -245,41 +273,14 @@ func (infos *Infos) startBot() (err error) {
 		cleanFiles(CleanRealm{ID: botID, Cate: "bot", Realm: "cache", Filter: true})
 	}
 
-	// 如果配置文件中包含 BotToken, 优先让 Bot 上线用来交互与监听管理指令
-	botConf := telegram.ClientConfig{
-		AppID:        infos.Conf.AppID,
-		AppHash:      infos.Conf.AppHash,
-		LogLevel:     telegram.LogError,
-		Session:      filepath.Join(infos.FilesPath, "bot.session"),
-		Cache:        telegram.NewCache(filepath.Join(infos.FilesPath, "bot.cache")),
-		CacheSenders: true,
-		DeviceConfig: telegram.DeviceConfig{
-			DeviceModel:   "Android",
-			SystemVersion: "Android 14",
-			AppVersion:    "10.14.3",
-		},
-		FloodHandler: func(err error) bool {
-			wait := 3
-			matches := infos.Rex.FindStringSubmatch(strings.ToUpper(err.Error()))
-			if len(matches) > 1 {
-				if value, err := strconv.Atoi(matches[1]); err == nil {
-					wait = value
-				}
-			}
-			log.Printf("下载太过频繁, 等待 %d 秒后重试", wait)
-			time.Sleep(time.Duration(wait) * time.Second)
-			return true
-		},
-	}
-
 	// 创建 Bot 客户端
-	client, err := telegram.NewClient(botConf)
+	client, err := telegram.NewClient(botConf("bot"))
 	if err != nil {
 		// 清理缓存
 		cleanFiles(CleanRealm{Cate: "bot", Realm: "session"})
 		cleanFiles(CleanRealm{Cate: "bot", Realm: "cache", Filter: false})
 		log.Printf("创建 Bot 客户端失败: %+v", err)
-		return
+		return err
 	}
 
 	// 连接 Bot
@@ -288,7 +289,7 @@ func (infos *Infos) startBot() (err error) {
 		cleanFiles(CleanRealm{Cate: "bot", Realm: "session"})
 		cleanFiles(CleanRealm{Cate: "bot", Realm: "cache", Filter: false})
 		log.Printf("Bot 连接失败: %+v", err)
-		return
+		return err
 	}
 
 	// 登录 Bot
@@ -297,7 +298,7 @@ func (infos *Infos) startBot() (err error) {
 		cleanFiles(CleanRealm{Cate: "bot", Realm: "session"})
 		cleanFiles(CleanRealm{Cate: "bot", Realm: "cache", Filter: false})
 		log.Printf("Bot 登录失败: %+v", err)
-		return
+		return err
 	}
 
 	// 注册 Bot 命令处理函数
@@ -307,7 +308,7 @@ func (infos *Infos) startBot() (err error) {
 	infos.Mutex.Lock()
 	infos.BotClient = client
 	infos.Mutex.Unlock()
-	return
+	return nil
 }
 
 func (infos *Infos) userBotClient() (err error) {
@@ -317,36 +318,12 @@ func (infos *Infos) userBotClient() (err error) {
 		cleanFiles(CleanRealm{ID: userID, Cate: "user", Realm: "cache", Filter: true})
 	}
 
-	botConf := telegram.ClientConfig{
-		AppID:        infos.Conf.AppID,
-		AppHash:      infos.Conf.AppHash,
-		LogLevel:     telegram.LogError,
-		Session:      filepath.Join(infos.FilesPath, "user.session"),
-		Cache:        telegram.NewCache(filepath.Join(infos.FilesPath, "user.cache")),
-		CacheSenders: true,
-		DeviceConfig: telegram.DeviceConfig{
-			DeviceModel:   "Android",
-			SystemVersion: "Android 14",
-			AppVersion:    "10.14.3",
-		},
-		FloodHandler: func(err error) bool {
-			wait := 3
-			matches := infos.Rex.FindStringSubmatch(strings.ToUpper(err.Error()))
-			if len(matches) > 1 {
-				if value, err := strconv.Atoi(matches[1]); err == nil {
-					wait = value
-				}
-			}
-			log.Printf("下载太过频繁, 等待 %d 秒后重试", wait)
-			time.Sleep(time.Duration(wait) * time.Second)
-			return true
-		},
-	}
+	conf := botConf("user")
 	if infos.Conf.DC != 0 {
-		botConf.DataCenter = infos.Conf.DC
+		conf.DataCenter = infos.Conf.DC
 	}
 
-	client, err := telegram.NewClient(botConf)
+	client, err := telegram.NewClient(conf)
 	if err != nil {
 		// 清理缓存
 		cleanFiles(CleanRealm{Cate: "user", Realm: "session"})
@@ -371,15 +348,18 @@ func (infos *Infos) userBotClient() (err error) {
 	return err
 }
 
+// startUserBot 发起手机号登录流程
 func (infos *Infos) startUserBot(phone string) (err error) {
 	infos.Mutex.Lock()
 	switch infos.Status {
 	case 1, 2:
+		// 正在进行验证码或密码输入状态，不允许重复发起
 		infos.Mutex.Unlock()
 		err = errors.New("已有登录流程正在进行")
 		log.Printf("UserBot 登录失败: %+v", err)
 		return err
 	case 3:
+		// 已登录状态，若客户端实例丢失则尝试重建
 		infos.Mutex.Unlock()
 		if infos.UserClient == nil {
 			if err := infos.userBotClient(); err != nil {
@@ -390,6 +370,7 @@ func (infos *Infos) startUserBot(phone string) (err error) {
 		}
 		return nil
 	default:
+		// 未登录状态，开始新的登录流程
 		infos.Mutex.Unlock()
 		if infos.UserClient == nil {
 			if err := infos.userBotClient(); err != nil {
@@ -398,21 +379,18 @@ func (infos *Infos) startUserBot(phone string) (err error) {
 				return err
 			}
 		}
-		if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, fmt.Sprintf("收到手机号 %s, 正在尝试发送验证码...", phone)); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
-		// 启动登录流程（会阻塞, 直到登录完成或失败）
+		sendMS(nil, fmt.Sprintf("收到手机号 %s, 正在尝试发送验证码...", phone), nil, 60)
+
+		// 在协程中执行阻塞的登录命令
 		go func() {
 			status, err := infos.UserClient.Login(phone, &telegram.LoginOptions{
-				CodeCallback:     infos.code,
-				PasswordCallback: infos.pass,
+				CodeCallback:     infos.code, // 指定验证码回调函数
+				PasswordCallback: infos.pass, // 指定二步验证回调函数
 				MaxRetries:       3,
 			})
 			if err != nil {
 				log.Printf("UserBot 登录失败: %+v", err)
-				if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, fmt.Sprintf("登录失败: %+v", err)); err != nil && infos.Status != 0 {
-					log.Printf("发送消息失败: %+v", err)
-				}
+				sendMS(nil, fmt.Sprintf("UserBot 登录失败: %+v", err), nil, 60)
 				infos.resetStatus()
 				return
 			}
@@ -459,17 +437,8 @@ func (infos *Infos) startUserBotQR() (err error) {
 				return err
 			}
 		}
-		if ms, err := infos.BotClient.SendMessage(infos.Conf.UserID, "正在请求登录二维码..."); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		} else {
-			go func() {
-				time.Sleep(35 * time.Second)
-				_, err := ms.Delete()
-				if err != nil {
-					log.Printf("删除消息失败: %+v", err)
-				}
-			}()
-		}
+		sendMS(nil, "正在请求登录二维码...", nil, 60)
+
 		// 启动登录流程（会阻塞, 直到登录完成或失败）
 		go func() {
 			qr, err := infos.UserClient.QRLogin(telegram.QrOptions{
@@ -478,9 +447,7 @@ func (infos *Infos) startUserBotQR() (err error) {
 			if err != nil {
 				log.Printf("获取 QR 登录失败: %+v", err)
 				if !telegram.MatchError(err, "SESSION_PASSWORD_NEEDED]") {
-					if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, fmt.Sprintf("获取 QR 登录失败: %+v", err)); err != nil {
-						log.Printf("发送消息失败: %+v", err)
-					}
+					sendMS(nil, fmt.Sprintf("获取 QR 登录失败: %+v", err), nil, 60)
 					infos.resetStatus()
 					return
 				}
@@ -492,36 +459,18 @@ func (infos *Infos) startUserBotQR() (err error) {
 				return
 			}
 
-			inputFile, err := infos.BotClient.UploadFile(png, &telegram.UploadOptions{
+			src, err := infos.BotClient.UploadFile(png, &telegram.UploadOptions{
 				FileName: "qr.png",
 			})
 			if err != nil {
 				log.Printf("上传 QR 文件失败: %+v", err)
 				return
 			}
-
-			if ms, err := infos.BotClient.SendMessage(infos.Conf.UserID, inputFile, &telegram.SendOptions{
-				Caption: "请使用手机 Telegram 扫描此二维码登录。二维码有效期 30 秒，如失效请重新发送 /qr",
-			}); err != nil {
-				log.Printf("发送 QR 图片失败: %+v", err)
-			} else {
-				log.Printf("二维码已发送给管理员")
-				go func() {
-					time.Sleep(35 * time.Second)
-					_, err := ms.Delete()
-					if err != nil {
-						log.Printf("删除消息失败: %+v", err)
-					}
-				}()
-			}
-
+			sendMS(nil, src, &telegram.SendOptions{Caption: "请使用手机 Telegram 扫描此二维码登录。二维码有效期 30 秒，如失效请重新发送 /qr"}, 35)
 			err = qr.WaitLogin()
 			if err != nil {
 				if !strings.Contains(err.Error(), "scanning again") {
-					log.Printf("QR 登录失败: %+v", err)
-					if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, fmt.Sprintf("QR 登录失败: %+v", err)); err != nil && infos.Status != 0 {
-						log.Printf("发送消息失败: %+v", err)
-					}
+					sendMS(nil, fmt.Sprintf("QR 登录失败: %+v", err), nil, 60)
 					infos.resetStatus()
 					return
 				}
@@ -554,10 +503,7 @@ func (infos *Infos) checkStatus() (err error) {
 		if me.Username != "" {
 			name = "@" + me.Username
 		}
-		log.Printf("登录成功! 用户: %s", name)
-		if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, fmt.Sprintf("登录成功! 用户: %s", name)); err != nil && infos.Status != 0 {
-			log.Printf("发送消息失败: %+v", err)
-		}
+		sendMS(nil, fmt.Sprintf("登录成功! 用户: %s", name), nil)
 		infos.Mutex.Lock()
 		infos.Status = 3
 		infos.Mutex.Unlock()
@@ -576,24 +522,21 @@ func (infos *Infos) checkStatus() (err error) {
 
 func (infos *Infos) code() (code string, err error) {
 	if infos.Status == 0 {
-		log.Println("等待用户输入验证码...")
 		infos.Mutex.Lock()
 		infos.Status = 1
 		infos.Mutex.Unlock()
-		if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, "等待用户输入 /code 验证码..."); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
+		sendMS(nil, "等待用户输入 /code 验证码...", nil, 120)
 		select {
 		case code := <-infos.Code:
-			log.Printf("收到验证码: %s", code)
 			return code, nil
 		case <-time.After(2 * time.Minute):
 			err = errors.New("等待验证码超时")
+			sendMS(nil, err.Error(), nil, 60)
 			return "", err
 		}
 	} else {
 		err = errors.New("当前状态不是等待验证码")
-		log.Printf("提交验证码失败: %+v", err)
+		sendMS(nil, err.Error(), nil, 60)
 		return "", err
 	}
 }
@@ -604,7 +547,7 @@ func (infos *Infos) submitCode(code string) (err error) {
 
 	if infos.Status != 1 {
 		err = errors.New("当前状态不是等待验证码")
-		log.Printf("提交验证码失败: %+v", err)
+		sendMS(nil, err.Error(), nil, 60)
 		return err
 	}
 	infos.Code <- code
@@ -613,24 +556,21 @@ func (infos *Infos) submitCode(code string) (err error) {
 
 func (infos *Infos) pass() (pass string, err error) {
 	if infos.Status == 1 {
-		log.Println("等待用户输入2FA密码...")
 		infos.Mutex.Lock()
 		infos.Status = 2
 		infos.Mutex.Unlock()
-		if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, "等待用户输入 /pass 2FA密码..."); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
+		sendMS(nil, "等待用户输入 /pass 2FA密码...", nil, 120)
 		select {
 		case pass := <-infos.Pass:
-			log.Printf("收到密码: %s", pass)
 			return pass, nil
 		case <-time.After(2 * time.Minute):
-			err = errors.New("等待密码超时")
+			err = errors.New("等待2FA密码超时")
+			sendMS(nil, err.Error(), nil, 60)
 			return "", err
 		}
 	} else {
-		err = errors.New("当前状态不是等待密码")
-		log.Printf("提交密码失败: %+v", err)
+		err = errors.New("当前状态不是等待2FA密码")
+		sendMS(nil, err.Error(), nil, 60)
 		return "", err
 	}
 }
@@ -640,8 +580,8 @@ func (infos *Infos) submitPass(pass string) (err error) {
 	defer infos.Mutex.Unlock()
 
 	if infos.Status != 2 {
-		err = errors.New("当前状态不是等待密码")
-		log.Printf("提交密码失败: %+v", err)
+		err = errors.New("当前状态不是等待2FA密码")
+		sendMS(nil, err.Error(), nil, 60)
 		return err
 	}
 	infos.Pass <- pass
@@ -649,14 +589,15 @@ func (infos *Infos) submitPass(pass string) (err error) {
 }
 
 func (infos *Infos) resetStatus() {
-	// 断开连接
+	// 1. 断开连接并清理句柄
 	if err := infos.UserClient.Disconnect(); err != nil {
 		log.Printf("UserBot 断开连接失败: %+v", err)
 	}
-	// 清理缓存
+	// 2. 清理磁盘上的 Session 和 Cache 文件（防止因文件损坏导致的下次循环失败）
 	cleanFiles(CleanRealm{Cate: "user", Realm: "session"})
 	cleanFiles(CleanRealm{Cate: "user", Realm: "cache", Filter: false})
-	// 重置状态
+
+	// 3. 重置内存状态
 	infos.Mutex.Lock()
 	infos.UserClient = nil
 	infos.Status = 0
@@ -706,18 +647,21 @@ func (infos *Infos) checkHash(hash string) int64 {
 	return 0
 }
 
+// handleMain 是 HTTP 服务的主分发函数，根据路径路由到不同的处理器
 func handleMain(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+	// 标准化路径处理，移除尾部斜杠
 	if path != "/" {
 		path = strings.TrimSuffix(path, "/")
 	}
 	switch {
 	case path == "/":
+		// 返回服务器状态 JSON
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		content := map[string]any{
 			"message": "服务器正在运行。",
 			"ok":      true,
-			"uptime":  handleTime(uint64(time.Since(startTime).Seconds())),
+			"uptime":  handleTime(uint64(time.Since(startTime).Seconds())), // 运行时间
 			"version": version,
 		}
 		err := json.NewEncoder(w).Encode(content)
@@ -726,12 +670,15 @@ func handleMain(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	case strings.HasPrefix(path, "/link"):
+		// 处理链接直链提取并跳转
 		handleLink(w, r)
 		return
 	case strings.HasPrefix(path, "/stream"):
+		// 处理文件分片流式下载（串流播放）核心接口
 		handleStream(w, r)
 		return
 	default:
+		// 404
 		http.NotFound(w, r)
 		return
 	}
@@ -757,40 +704,36 @@ func handleBotCommand(m *telegram.NewMessage) error {
 
 	switch {
 	case strings.HasPrefix(text, "/start"):
-		if m.SenderID() != infos.Conf.UserID {
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+		if !infos.isWhite(m.SenderID()) {
+			sendMS(m, "你没有使用此机器人的权限", nil, 60)
 			return nil
 		}
+
 		var src string
-		switch infos.Status {
-		case 0:
-			src = "userBot 未登录, 仅使用 Bot 或发送 /phone 手机号登录 userBot"
-		case 1:
-			src = "正在等待验证码, 请发送 /code 验证码"
-		case 2:
-			src = "正在等待密码, 请发送 /pass 密码"
-		case 3:
-			src = "userBot 已登录"
+		if m.SenderID() == infos.Conf.UserID {
+			switch infos.Status {
+			case 0:
+				src = "userBot 未登录, 仅使用 Bot 或发送 /phone 手机号登录 userBot"
+			case 1:
+				src = "正在等待验证码, 请发送 /code 验证码"
+			case 2:
+				src = "正在等待密码, 请发送 /pass 密码"
+			case 3:
+				src = "userBot 已登录"
+			}
+		} else {
+			src = "仅限内部使用"
 		}
-		if _, err := m.Reply(src); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
+		sendMS(m, src, nil, 60)
 		return nil
 	case strings.HasPrefix(text, "/allow"):
 		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
 			return nil
 		}
 		whiteID, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(text, "/allow")), 10, 64)
 		if err != nil {
-			if _, err := m.Reply(fmt.Sprintf("添加白名单失败: %+v", err)); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, fmt.Sprintf("添加白名单失败: %+v", err), nil, 60)
 			return nil
 		}
 		if whiteID != 0 {
@@ -798,24 +741,17 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			infos.Conf.WhiteIDs = append(infos.Conf.WhiteIDs, whiteID)
 			infos.HasNew = true
 			infos.Mutex.Unlock()
-			if _, err := m.Reply(fmt.Sprintf("添加白名单成功: %d", whiteID)); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, fmt.Sprintf("添加白名单成功: %d", whiteID), nil, 60)
 		}
 		return nil
 	case strings.HasPrefix(text, "/disallow"):
 		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
 			return nil
 		}
 		whiteID, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(text, "/disallow")), 10, 64)
 		if err != nil {
-			if _, err := m.Reply(fmt.Sprintf("移除白名单失败: %+v", err)); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, fmt.Sprintf("移除白名单失败: %+v", err), nil, 60)
 			return nil
 		}
 		if whiteID != 0 {
@@ -830,29 +766,31 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				infos.Mutex.Lock()
 				infos.HasNew = true
 				infos.Mutex.Unlock()
-				if _, err := m.Reply(fmt.Sprintf("移除白名单成功: %d", whiteID)); err != nil {
-					log.Printf("发送消息失败: %+v", err)
-				}
+				sendMS(m, fmt.Sprintf("移除白名单成功: %d", whiteID), nil, 60)
 			} else {
-				if _, err := m.Reply(fmt.Sprintf("用户 %d 不在白名单中", whiteID)); err != nil {
-					log.Printf("发送消息失败: %+v", err)
-				}
+				sendMS(m, fmt.Sprintf("用户 %d 不在白名单中", whiteID), nil, 60)
 			}
 		}
 		return nil
+	case strings.HasPrefix(text, "/qr"):
+		if m.SenderID() != infos.Conf.UserID {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
+			return nil
+		}
+
+		if err := infos.startUserBotQR(); err != nil {
+			sendMS(m, fmt.Sprintf("启动 QR 登录失败: %+v", err), nil, 60)
+			return nil
+		}
+		return nil
 	case strings.HasPrefix(text, "/phone"):
-		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+		if m.SenderID() != infos.Conf.UserID {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
 			return nil
 		}
 		content := strings.TrimSpace(strings.TrimPrefix(text, "/phone"))
 		if content == "" {
-			if _, err := m.Reply("手机不能为空"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "手机不能为空", nil, 60)
 			return nil
 		}
 
@@ -861,93 +799,115 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		}
 
 		if err := infos.startUserBot(content); err != nil {
-			if _, err := m.Reply(fmt.Sprintf("启动 UserBot 失败: %+v", err)); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
-			return nil
-		}
-		return nil
-	case strings.HasPrefix(text, "/qr"):
-		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
-			return nil
-		}
-
-		if err := infos.startUserBotQR(); err != nil {
-			if _, err := m.Reply(fmt.Sprintf("启动 QR 登录失败: %+v", err)); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, fmt.Sprintf("启动 UserBot 失败: %+v", err), nil, 60)
 			return nil
 		}
 		return nil
 	case strings.HasPrefix(text, "/code"):
-		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+		if m.SenderID() != infos.Conf.UserID {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
 			return nil
 		}
 
 		code := strings.TrimSpace(strings.TrimPrefix(text, "/code"))
 		if code == "" {
-			if _, err := m.Reply("验证码不能为空"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "验证码不能为空", nil, 60)
 			return nil
 		}
 
 		if err := infos.submitCode(code); err != nil {
-			if _, err := m.Reply(fmt.Sprintf("提交验证码失败: %+v", err)); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, fmt.Sprintf("提交验证码失败: %+v", err), nil, 60)
 			return nil
 		}
-		if _, err := m.Reply("提交验证码成功"); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
+		sendMS(m, "提交验证码成功", nil, 60)
 		return nil
 	case strings.HasPrefix(text, "/pass"):
-		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+		if m.SenderID() != infos.Conf.UserID {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
 			return nil
 		}
 
 		pass := strings.TrimSpace(strings.TrimPrefix(text, "/pass"))
 		if pass == "" {
-			if _, err := m.Reply("密码不能为空"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "2FA密码不能为空", nil, 60)
 			return nil
 		}
 
 		if err := infos.submitPass(pass); err != nil {
-			if _, err := m.Reply(fmt.Sprintf("提交密码失败: %+v", err)); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, fmt.Sprintf("提交2FA密码失败: %+v", err), nil, 60)
 			return nil
 		}
-		if _, err := m.Reply("提交密码成功"); err != nil {
-			log.Printf("发送消息失败: %+v", err)
+		sendMS(m, "提交2FA密码成功", nil, 60)
+		return nil
+	case strings.HasPrefix(text, "/dc"):
+		if !infos.isAdmin(m.SenderID()) {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
+			return nil
 		}
+		content := strings.TrimSpace(strings.TrimPrefix(text, "/dc"))
+		if content == "" {
+			sendMS(m, fmt.Sprintf("当前DC: %d", infos.Conf.DC), nil, 60)
+			return nil
+		}
+		value, err := strconv.Atoi(content)
+		if err != nil {
+			sendMS(m, fmt.Sprintf("DC格式错误: %+v", err), nil, 60)
+			return nil
+		}
+		if value < 1 || value > 5 {
+			sendMS(m, "DC必须在1-5之间", nil, 60)
+			return nil
+		}
+		infos.Mutex.Lock()
+		infos.Conf.DC = value
+		infos.HasNew = true
+		infos.Mutex.Unlock()
+		sendMS(m, fmt.Sprintf("DC已设置为: %d, 重启后生效", value), nil, 60)
+		return nil
+	case strings.HasPrefix(text, "/site"):
+		if !infos.isAdmin(m.SenderID()) {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
+			return nil
+		}
+		content := strings.TrimSpace(strings.TrimPrefix(text, "/site"))
+		if content == "" {
+			sendMS(m, fmt.Sprintf("当前反代地址: %s", infos.Conf.Site), nil, 60)
+			return nil
+		}
+		if !strings.HasPrefix(content, "http") {
+			sendMS(m, "反代地址格式错误", nil, 60)
+			return nil
+		}
+		infos.Mutex.Lock()
+		infos.Conf.Site = content
+		infos.HasNew = true
+		infos.Mutex.Unlock()
+		sendMS(m, fmt.Sprintf("反代地址已设置为: %s", content), nil, 60)
+		return nil
+	case strings.HasPrefix(text, "/password"):
+		if !infos.isAdmin(m.SenderID()) {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
+			return nil
+		}
+		content := strings.TrimSpace(strings.TrimPrefix(text, "/password"))
+		if content == "" {
+			sendMS(m, fmt.Sprintf("当前密码: %s", infos.Conf.Password), nil, 60)
+			return nil
+		}
+		infos.Mutex.Lock()
+		infos.Conf.Password = content
+		infos.HasNew = true
+		infos.Mutex.Unlock()
+		sendMS(m, fmt.Sprintf("密码已设置为: %s", content), nil, 60)
 		return nil
 	case strings.HasPrefix(text, "/channel"):
 		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
 			return nil
 		}
 		content := strings.TrimSpace(strings.TrimPrefix(text, "/channel"))
 		if content == "" {
-			log.Print("频道ID不能为空")
+			sendMS(m, fmt.Sprintf("当前频道ID: %d", infos.Conf.ChannelID), nil, 60)
 			return nil
 		}
 		if !strings.HasPrefix(content, "-100") {
@@ -955,134 +915,53 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		}
 		value, err := strconv.ParseInt(content, 10, 64)
 		if err != nil {
-			if _, err := m.Reply(fmt.Sprintf("频道ID格式错误: %+v", err)); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, fmt.Sprintf("频道ID格式错误: %+v", err), nil, 60)
 			return nil
 		}
 		infos.Mutex.Lock()
 		infos.Conf.ChannelID = value
 		infos.HasNew = true
 		infos.Mutex.Unlock()
-		log.Printf("频道ID已设置为: %d", value)
-		if _, err := m.Reply(fmt.Sprintf("频道ID已设置为: %d", value)); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
+		sendMS(m, fmt.Sprintf("频道ID已设置为: %d", value), nil, 60)
 		return nil
 	case strings.HasPrefix(text, "/workers"):
 		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
 			return nil
 		}
 		content := strings.TrimSpace(strings.TrimPrefix(text, "/workers"))
 		if content == "" {
-			log.Print("并发数不能为空")
+			sendMS(m, fmt.Sprintf("当前并发数: %d", infos.Conf.Workers), nil, 60)
 			return nil
 		}
 
 		num, err := strconv.Atoi(content)
 		if err != nil {
-			log.Print("并发数必须为数字")
+			sendMS(m, "并发数必须为数字", nil, 60)
 			return nil
 		}
 		if num <= 0 {
-			log.Print("并发数必须大于 0")
+			sendMS(m, "并发数必须大于 0", nil, 60)
 			return nil
 		}
 		if num > 4 {
-			log.Print("并发数不建议超过 4, 否则可能导致下载失败甚至封号")
-			if _, err := m.Reply("并发数不建议超过 4, 否则可能导致下载失败甚至封号"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "并发数不建议超过 4, 否则可能导致下载失败甚至封号", nil, 60)
 			return nil
 		}
 		infos.Mutex.Lock()
 		infos.Conf.Workers = num
 		infos.HasNew = true
 		infos.Mutex.Unlock()
-		log.Printf("并发数已设置为: %d", num)
-		if _, err := m.Reply(fmt.Sprintf("并发数已设置为: %d", num)); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
-		return nil
-	case strings.HasPrefix(text, "/info"):
-		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
-			return nil
-		}
-
-		num := 10
-		content := strings.TrimSpace(strings.TrimPrefix(text, "/info"))
-		if content != "" {
-			if value, err := strconv.Atoi(content); err == nil && value > 0 {
-				num = value
-			}
-		}
-
-		// 读取日志
-		lines, err := readLastLines(infos.FilePath, num)
-		if err != nil {
-			if _, err := m.Reply(fmt.Sprintf("读取日志失败: %+v", err)); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
-			return nil
-		}
-
-		if len(lines) == 0 {
-			if _, err := m.Reply("暂无日志内容"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
-			return nil
-		}
-
-		const maxCount = 4000
-		var values strings.Builder
-		header := fmt.Sprintf("<b>📜 系统日志 (最后 %d 行)</b>\n\n", len(lines))
-		values.WriteString(header)
-		values.WriteString("<pre>")
-
-		for _, line := range lines {
-			line = html.EscapeString(line) + "\n"
-			// 如果当前消息加上这行和 </pre> 后超过限制，则先发送当前部分
-			if values.Len()+len(line)+len("</pre>") > maxCount {
-				values.WriteString("</pre>")
-				if _, err := m.Reply(values.String()); err != nil {
-					log.Printf("发送消息失败: %+v", err)
-				}
-				// 重置 Builder 开启下一个分片
-				values.Reset()
-				values.WriteString("<pre>")
-			}
-			values.WriteString(line)
-		}
-
-		// 发送剩余内容
-		if values.Len() > len("<pre>") {
-			values.WriteString("</pre>")
-			if _, err := m.Reply(values.String()); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
-		}
+		sendMS(m, fmt.Sprintf("并发数已设置为: %d", num), nil, 60)
 		return nil
 	case strings.HasPrefix(text, "/check"):
 		if !infos.isAdmin(m.SenderID()) {
-			log.Printf("收到非管理员消息: %d", m.SenderID())
-			if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
 			return nil
 		}
 		content := strings.TrimSpace(strings.TrimPrefix(text, "/check"))
 		if content == "" {
-			if _, err := m.Reply("请输入要检查的哈希值"); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, "请提供要检查的哈希值", nil, 60)
 			return nil
 		}
 		if uid := infos.checkHash(content); uid != 0 {
@@ -1104,14 +983,88 @@ func handleBotCommand(m *telegram.NewMessage) error {
 				values.WriteString(fmt.Sprintf("• <b>用户昵称</b>: @%s\n", user.Username))
 			}
 			// 使用 HTML 解析模式发送
-			if _, err := m.Reply(values.String(), &telegram.SendOptions{ParseMode: "html"}); err != nil {
-				log.Printf("发送消息失败: %+v", err)
-			}
+			sendMS(m, values.String(), nil, 60)
 			return nil
 		}
 		return nil
+	case strings.HasPrefix(text, "/port"):
+		if !infos.isAdmin(m.SenderID()) {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
+			return nil
+		}
+		content := strings.TrimSpace(strings.TrimPrefix(text, "/port"))
+		if content == "" {
+			sendMS(m, "请提供要修改的端口", nil, 60)
+			return nil
+		}
+		value, err := strconv.Atoi(content)
+		if err != nil {
+			sendMS(m, "端口格式错误", nil, 60)
+			return nil
+		}
+		if value <= 0 || value > 65535 {
+			sendMS(m, "端口必须在 1-65535 之间", nil, 60)
+			return nil
+		}
+		infos.Mutex.Lock()
+		infos.Conf.Port = value
+		infos.HasNew = true
+		infos.Mutex.Unlock()
+		sendMS(m, fmt.Sprintf("端口已设置为: %d, 重启后生效", value), nil, 60)
+		return nil
+	case strings.HasPrefix(text, "/info"):
+		if !infos.isAdmin(m.SenderID()) {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
+			return nil
+		}
+
+		num := 10
+		content := strings.TrimSpace(strings.TrimPrefix(text, "/info"))
+		if content != "" {
+			if value, err := strconv.Atoi(content); err == nil && value > 0 {
+				num = value
+			}
+		}
+
+		// 读取日志
+		lines, err := readLastLines(infos.FilePath, num)
+		if err != nil {
+			sendMS(m, fmt.Sprintf("读取日志失败: %+v", err), nil, 60)
+			return nil
+		}
+
+		if len(lines) == 0 {
+			sendMS(m, "暂无日志内容", nil, 60)
+			return nil
+		}
+
+		const maxCount = 4000
+		var values strings.Builder
+		header := fmt.Sprintf("<b>📜 系统日志 (最后 %d 行)</b>\n\n", len(lines))
+		values.WriteString(header)
+		values.WriteString("<pre>")
+
+		for _, line := range lines {
+			line = html.EscapeString(line) + "\n"
+			// 如果当前消息加上这行和 </pre> 后超过限制，则先发送当前部分
+			if values.Len()+len(line)+len("</pre>") > maxCount {
+				values.WriteString("</pre>")
+				sendMS(m, values.String(), nil)
+				// 重置 Builder 开启下一个分片
+				values.Reset()
+				values.WriteString("<pre>")
+			}
+			values.WriteString(line)
+		}
+
+		// 发送剩余内容
+		if values.Len() > len("<pre>") {
+			values.WriteString("</pre>")
+			sendMS(m, values.String(), nil)
+		}
+		return nil
 	default:
-		if !infos.isWhiteList(m.SenderID()) && m.SenderID() != 0 {
+		if !infos.isWhite(m.SenderID()) && m.SenderID() != 0 {
 			return nil
 		}
 		return handleMess(m)
@@ -1135,9 +1088,6 @@ func handleMess(m *telegram.NewMessage) error {
 
 	src := strings.TrimSpace(m.Text())
 	if src == "" {
-		if _, err := m.Reply("消息为空"); err != nil {
-			log.Printf("发送消息失败: %+v", err)
-		}
 		return nil
 	}
 
@@ -1191,11 +1141,12 @@ func handleMediaCate(fileName string) string {
 }
 
 // handleStream 处理来自 HTTP 的文件流式读取请求
+// 该函数实现了 Range 分段下载支持，允许像播放普通 mp4 文件一样拖动进度条
 func handleStream(w http.ResponseWriter, r *http.Request) {
-	// 获取 URL 传参
+	// 1. 获取 URL 参数并完成身份校验
 	params := r.URL.Query()
 	if infos.Conf.Password != "" {
-		hash := params.Get("hash")
+		hash := params.Get("hash") // 基于用户 ID 的哈希校验
 		password := params.Get("key")
 		switch {
 		case password != "":
@@ -1219,6 +1170,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 2. 解析频道 ID 和 消息 ID
 	cid, err := strconv.ParseInt(params.Get("cid"), 10, 64)
 	if err != nil || cid == 0 {
 		if infos.Conf.ChannelID != 0 {
@@ -1232,6 +1184,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 
 	value, err := strconv.ParseInt(params.Get("mid"), 10, 32)
 	if err != nil || value == 0 {
+		// 尝试从路径中提取 (兼容模式)
 		re := regexp.MustCompile(`/stream/(\d+)/[a-zA-Z0-9]+`)
 		matches := re.FindStringSubmatch(r.URL.Path)
 		if len(matches) == 2 {
@@ -1247,6 +1200,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	mid := int32(value)
 
+	// 3. 选择下载客户端 (Bot 或 UserBot)
 	cate := params.Get("cate")
 	if cate == "user" && infos.Status == 3 {
 		infos.Client = infos.UserClient
@@ -1254,9 +1208,8 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		infos.Client = infos.BotClient
 	}
 
-	// 获取消息内容 (增加一次重试逻辑, 解决由于长时间闲置导致 Peer 缓存失效的问题)
+	// 4. 从 Telegram 获取指定消息
 	ms, err := infos.Client.GetMessages(cid, &telegram.SearchOption{IDs: []int32{mid}})
-
 	if err != nil || len(ms) == 0 {
 		log.Printf("获取消息失败: cid=%d, mid=%d, err=%v, count=%d", cid, mid, err, len(ms))
 		http.Error(w, fmt.Sprintf("获取消息失败: cid=%d, mid=%d, err=%v, count=%d", cid, mid, err, len(ms)), http.StatusNotFound)
@@ -1264,7 +1217,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	src := ms[0]
 
-	// 确保消息包含媒体文件
+	// 5. 确保消息包含媒体文件并获取元数据
 	if !src.IsMedia() {
 		log.Printf("消息不包含媒体: cid=%d, mid=%d", cid, mid)
 		http.Error(w, fmt.Sprintf("消息不包含媒体: cid=%d, mid=%d", cid, mid), http.StatusBadRequest)
@@ -1273,7 +1226,11 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 
 	size := src.File.Size
 	fileName := src.File.Name
+
+	// 创建新的 Stream 流管理对象
 	stream := newStream(r.Context(), infos.Client, src.Media(), infos.Conf.Workers, mid, cid, fileName)
+
+	// 如果是转发的消息，重定向源频道以确保分片下载稳定性
 	if src.Message.FwdFrom != nil {
 		if ch, ok := src.Message.FwdFrom.FromID.(*telegram.PeerChannel); ok {
 			stream.CID = ch.ChannelID
@@ -1281,24 +1238,28 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("Accept-Ranges", "bytes")
+	// 6. 设置 HTTP 响应头
+	w.Header().Set("Accept-Ranges", "bytes") // 启用 Range 支持
 	w.Header().Set("Content-Type", handleMediaCate(fileName))
 
 	disposition := "inline"
 	if r.URL.Query().Get("download") == "true" {
-		disposition = "attachment"
+		disposition = "attachment" // 附件模式下载
 	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, fileName))
 
+	// 7. 处理 HTTP Range 请求（分段读取的核心逻辑）
 	var start, end int64
 	rangeHeader := r.Header.Get("Range")
 
 	if rangeHeader == "" {
+		// 全量读取
 		start = 0
 		end = size - 1
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
 	} else {
+		// 处理 Range 范围，例如：bytes=0-499
 		matches := regexp.MustCompile(`bytes= *([0-9]+) *- *([0-9]*)`).FindStringSubmatch(rangeHeader)
 		if matches != nil {
 			start, err = strconv.ParseInt(matches[1], 10, 64)
@@ -1329,35 +1290,42 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusPartialContent)
 	}
 
+	// 8. 启动并发下载协程
 	stream.ContentSize = end - start + 1
 	go stream.start(start, end)
-	defer stream.clean()
+	defer stream.clean() // 结束时清理
 
+	// 9. 循环从下载管道读取分片并写入 HTTP 响应体
 	if r.Method == http.MethodGet {
 		for {
 			select {
 			case <-r.Context().Done():
+				// 客户端断开连接（如浏览器关闭或拖动进度条导致旧请求作废）
 				log.Printf("流式传输文件已取消: cid=%d, mid=%d, fileName=%s", cid, mid, fileName)
 				return
 			case task := <-stream.Tasks:
+				// 读取一个下载好的分片任务
 				if task == nil {
 					log.Printf("流式传输文件出错: cid=%d, mid=%d, fileName=%s, error=任务为空", cid, mid, fileName)
 					continue
 				}
+				// 等待任务标记为 Done
 				task.Cond.L.Lock()
 				for !*task.Done {
 					task.Cond.Wait()
 				}
 				task.Cond.L.Unlock()
+
 				if task.Error != nil {
 					log.Printf("切片下载出错: cid=%d, mid=%d, start=%d, end=%d, fileName=%s, error=%+v", cid, mid, task.ContentStart, task.ContentEnd, fileName, task.Error)
 					return
 				}
+				// 写入响应
 				if _, err := w.Write(*task.Content); err != nil {
 					log.Printf("写入文件流时出错: cid=%d, mid=%d, err=%v", cid, mid, err)
 				}
 
-				// 判断是否下载完成
+				// 检查是否已经写完当前请求的所有范围
 				if task.ContentEnd >= end {
 					log.Printf("流式传输文件已完成: cid=%d, mid=%d", cid, mid)
 					return
@@ -1367,14 +1335,18 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 
 	} else {
+		// HEAD 请求只返回头部，不执行循环体
 		http.Error(w, fmt.Sprintf("不支持的请求方法: %s", r.Method), http.StatusMethodNotAllowed)
 		return
 	}
 }
 
+// handleLink 处理链接提取请求，将 Telegram 消息链接转换为直链下载地址并执行重定向
 func handleLink(w http.ResponseWriter, r *http.Request) {
 	res := HackLink{}
 	params := r.URL.Query()
+
+	// 1. 验证访问权限 (密码或哈希)
 	if infos.Conf.Password != "" {
 		hash := params.Get("hash")
 		password := params.Get("key")
@@ -1403,19 +1375,21 @@ func handleLink(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 2. 获取目标 Telegram 链接
 	src := params.Get("link")
 	if src == "" || !strings.HasPrefix(src, "http") {
 		http.Error(w, "无效的链接", http.StatusBadRequest)
 		return
 	}
 
-	// 编译正则表达式匹配 Telegram 链接格式
-	// 匹配格式如：t.me/c/12345/678 或 t.me/username/678
+	// 3. 正则匹配并解析链接
 	re := regexp.MustCompile(`t\.me\/(c\/(\d+)|([a-zA-Z0-9_]+))\/(\d+)(?:\?.*comment=(\d+))?`)
 	matches := re.FindAllStringSubmatch(src, -1)
 	res.Matches = matches
 
+	// 4. 调用解析核心逻辑提取直链
 	for _, link := range hackLink(res) {
+		// 成功提取到直链后执行 302 重定向
 		http.Redirect(w, r, link, http.StatusFound)
 		return
 	}
@@ -1434,6 +1408,7 @@ func handleTime(secs uint64) string {
 	return fmt.Sprintf("%ds", secs)
 }
 
+// readLastLines 读取日志文件的最后指定行数，供管理员查看
 func readLastLines(filePath string, count int) (lines []string, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -1445,9 +1420,11 @@ func readLastLines(filePath string, count int) (lines []string, err error) {
 		}
 	}()
 
+	// 使用 Scanner 遍历文件行
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
+		// 超过行数限制后，舍弃旧行（滑动窗口效果）
 		if len(lines) > count {
 			lines = lines[1:]
 		}
@@ -1458,13 +1435,14 @@ func readLastLines(filePath string, count int) (lines []string, err error) {
 	return lines, nil
 }
 
+// hackLink 是链接解析的核心逻辑，负责将 t.me 链接映射到具体的媒体消息并生成本程序的流地址
 func hackLink(res HackLink) (links []string) {
 	// 遍历所有匹配到的链接
 	for _, match := range res.Matches {
 		var cid any   // 用于 ResolvePeer 的标识项（可以是用户名或 chatID）
 		var mid int32 // 消息 ID
 
-		// 解析逻辑
+		// 1. 解析 Chat ID 或 Username
 		if match[2] != "" {
 			// 如果是 c/(\d+), 代表私有频道链接, 需要给 ID 补充前缀 -100
 			value, err := strconv.ParseInt("-100"+match[2], 10, 64)
@@ -1483,7 +1461,7 @@ func hackLink(res HackLink) (links []string) {
 			cid = match[3]
 		}
 
-		// 解析消息偏移 ID
+		// 2. 解析消息偏移 ID
 		value, err := strconv.ParseInt(match[4], 10, 32)
 		if err != nil {
 			log.Printf("解析消息ID失败: %+v", err)
@@ -1496,7 +1474,8 @@ func hackLink(res HackLink) (links []string) {
 		}
 		mid = int32(value)
 
-		// 使用 GetMessages 尝试获取目标消息, gogram 会自动映射 peer 为 InputPeer
+		// 3. 使用 UserBot 客户端尝试获取目标消息
+		// 注意：只有 UserBot 才能访问非机器人所在或未授权的私密链接
 		ms, err := infos.UserClient.GetMessages(cid, &telegram.SearchOption{IDs: []int32{mid}})
 		if err != nil || len(ms) == 0 {
 			log.Printf("获取消息失败: cid=%d, mid=%d, err=%v, count=%d", cid, mid, err, len(ms))
@@ -1509,6 +1488,8 @@ func hackLink(res HackLink) (links []string) {
 		}
 
 		src := ms[0] // 获取第一条目标消息
+
+		// 4. 处理链接中的评论 (comment) 逻辑，如果存在则寻找对应的评论消息
 		if match[5] != "" {
 			commentID, err := strconv.ParseInt(match[5], 10, 32)
 			if err != nil {
@@ -1516,20 +1497,20 @@ func hackLink(res HackLink) (links []string) {
 			}
 
 			// a. 检查该消息是否有讨论功能并获取讨论组 ID
-			// gogram 的 NewMessage 对象通过 .Message.Replies 获取元数据
 			if src.Message.Replies != nil && src.Message.Replies.ChannelID != 0 {
 				discussionID := src.Message.Replies.ChannelID // 讨论组的 ID
 
 				// b. 从讨论组中获取真正的评论消息
 				commentMs, err := infos.UserClient.GetMessages(discussionID, &telegram.SearchOption{IDs: []int32{int32(commentID)}})
 				if err == nil && len(commentMs) > 0 {
-					src = commentMs[0] // 将目标消息切换为评论消息
+					src = commentMs[0] // 将目标消息切换为评论内容
 					src.ID = int32(commentID)
 					src.Chat.ID = discussionID
 				}
 			}
 		}
-		// 判断该消息是否包含可下载的媒体内容
+
+		// 5. 校验消息是否包含可流式传输的媒体（图片、文档、视频）
 		if !src.IsMedia() || (src.Photo() == nil && src.Document() == nil && src.Video() == nil) {
 			log.Printf("消息不包含媒体: cid=%d, mid=%d", cid, mid)
 			if res.M != nil {
@@ -1540,12 +1521,16 @@ func hackLink(res HackLink) (links []string) {
 			continue
 		}
 
-		// 为媒体文件构造下载直链
+		// 6. 为该媒体构造本程序的下载直链 (流地址)
 		link := fmt.Sprintf("%s/stream?cid=%v&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID)
+
+		// 7. 处理 URL 的权限参数附加
 		if infos.Conf.Password != "" {
 			if res.M != nil {
+				// 自动为发起请求的用户生成哈希链接
 				link += fmt.Sprintf("&hash=%s&uid=%d", infos.calculateHash(res.M.SenderID()), res.M.SenderID())
 			} else {
+				// 手动提供 hash/pass 模式
 				switch {
 				case res.Hash != "" && res.UID != 0:
 					link += fmt.Sprintf("&hash=%s&uid=%d", res.Hash, res.UID)
@@ -1578,6 +1563,41 @@ func sendLink(m *telegram.NewMessage, link string) error {
 		log.Printf("发送下载链接失败: %+v", err)
 	}
 	return err
+}
+
+func sendMS(m *telegram.NewMessage, src any, params *telegram.SendOptions, wait ...int) {
+	switch {
+	case m != nil:
+		ms, err := m.Reply(src, params)
+		if err != nil {
+			log.Printf("发送消息失败: %+v", err)
+		}
+		if len(wait) > 0 && wait[0] > 0 {
+			go func() {
+				time.Sleep(time.Duration(wait[0]) * time.Second)
+				_, err = ms.Delete()
+				if err != nil {
+					log.Printf("删除消息失败: %+v", err)
+				}
+			}()
+		}
+		return
+	case infos.BotClient != nil:
+		ms, err := infos.BotClient.SendMessage(infos.Conf.UserID, src, params)
+		if err != nil {
+			log.Printf("发送消息失败: %+v", err)
+		}
+		if len(wait) > 0 && wait[0] > 0 {
+			go func() {
+				time.Sleep(time.Duration(wait[0]) * time.Second)
+				_, err = ms.Delete()
+				if err != nil {
+					log.Printf("删除消息失败: %+v", err)
+				}
+			}()
+		}
+		return
+	}
 }
 
 func cleanFiles(realm CleanRealm) {

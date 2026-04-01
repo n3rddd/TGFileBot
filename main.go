@@ -57,11 +57,16 @@ type OffSets struct {
 }
 
 type Item struct {
-	Name    string `json:"name"`
+	Name string `json:"name"`
+	MID  int32  `json:"mid"`
+	CID  int64  `json:"cid"`
+	Size int64  `json:"size"`
+}
+
+type Items struct {
+	HasMore bool   `json:"more"`
 	Channel string `json:"channel"`
-	MID     int32  `json:"mid"`
-	CID     int64  `json:"cid"`
-	Size    int64  `json:"size"`
+	Item    []Item `json:"item"`
 }
 
 // Infos 结构体保存了程序运行时的全局状态和资源句柄
@@ -681,11 +686,11 @@ func (infos *Infos) checkHash(hash string) int64 {
 	return 0
 }
 
-func (infos *Infos) search(channel, keywords string, page int) (items []Item, err error) {
+func (infos *Infos) search(channel, keywords string, page, limit int) (items Items, err error) {
 	ch, err := infos.UserClient.ResolvePeer(fmt.Sprintf("@%s", channel))
 	if err != nil {
 		log.Printf("频道解析失败: %+v", err)
-		return nil, err
+		return items, err
 	}
 
 	var offset int32 = 0
@@ -695,22 +700,26 @@ func (infos *Infos) search(channel, keywords string, page int) (items []Item, er
 		offset = values.Offset
 	}
 	offSets.Mutex.Unlock()
+	if page > 1 && offset == 0 {
+		return items, errors.New("未找到匹配消息")
+	}
 
 	ms, err := infos.UserClient.GetMessages(ch, &telegram.SearchOption{
 		Query:  keywords,                             // 搜索关键字
-		Limit:  20,                                   // 条数限制
+		Limit:  int32(limit),                         // 条数限制
 		Offset: offset,                               // 偏移量
 		Filter: &telegram.InputMessagesFilterVideo{}, // 过滤视频
 	})
+
 	if err != nil {
-		log.Printf("发送消息失败: %+v", err)
-		return nil, err
+		return items, err
 	}
 	if len(ms) == 0 {
-		return nil, errors.New("未找到匹配消息")
+		return items, errors.New("未找到匹配消息")
 	}
 
-	if len(ms) == 20 {
+	if len(ms) == limit {
+		items.HasMore = true
 		key := fmt.Sprintf("%s|%s|%d", channel, keywords, page+1)
 		offSets.Mutex.Lock()
 		offSets.OffSets[key] = OffSet{
@@ -723,16 +732,18 @@ func (infos *Infos) search(channel, keywords string, page int) (items []Item, er
 		if m.File == nil {
 			continue
 		}
+		if items.Channel == "" {
+			items.Channel = strings.TrimSpace(m.Channel.Title)
+		}
 		name := strings.TrimSpace(m.File.Name)
 		if name == "" {
 			name = strings.TrimSpace(m.Text())
 		}
-		items = append(items, Item{
-			Name:    name,
-			Size:    m.File.Size,
-			CID:     m.Channel.ID,
-			MID:     m.ID,
-			Channel: m.Channel.Title,
+		items.Item = append(items.Item, Item{
+			Name: name,
+			Size: m.File.Size,
+			CID:  m.Channel.ID,
+			MID:  m.ID,
 		})
 	}
 	return items, nil
@@ -1347,24 +1358,32 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	value := params.Get("page")
 	if value == "" {
-		log.Printf("缺少页码")
 		value = "1"
 	}
 	page, err := strconv.Atoi(value)
 	if err != nil || page <= 0 {
 		page = 1
 	}
+	value = params.Get("limit")
+	if value == "" {
+		value = "20"
+	}
+	limit, err := strconv.Atoi(value)
+	if err != nil || limit <= 0 {
+		limit = 20
+	}
+
 	ctx, cannel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cannel()
 	count := atomic.Int64{}
-	results := make(chan []Item, len(infos.Conf.Channels))
+	results := make(chan Items, len(infos.Conf.Channels))
 
 	for _, channel := range infos.Conf.Channels {
 		count.Add(1)
 		channel = strings.TrimPrefix(channel, "@")
 		go func(channel string) {
 			defer count.Add(-1)
-			result, err := infos.search(channel, keywords, page)
+			result, err := infos.search(channel, keywords, page, limit)
 			if err != nil {
 				log.Printf("搜索失败: %+v", err)
 				return
@@ -1379,7 +1398,12 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		}(channel)
 	}
 
-	items := make([]Item, 0, len(infos.Conf.Channels)*20)
+	var items struct {
+		HasMore bool    `json:"more"`
+		Items   []Items `json:"items"`
+	}
+
+	items.Items = make([]Items, 0, len(infos.Conf.Channels))
 	defer func() {
 		content, err := json.Marshal(items)
 		if err != nil {
@@ -1399,8 +1423,11 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case result := <-results:
-			if len(result) > 0 {
-				items = append(items, result...)
+			if len(result.Item) > 0 {
+				items.Items = append(items.Items, result)
+			}
+			if !items.HasMore && result.HasMore {
+				items.HasMore = result.HasMore
 			}
 		default:
 			if count.Load() == 0 {
@@ -1408,7 +1435,6 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-
 }
 
 // handleStream 处理来自 HTTP 的文件流式读取请求

@@ -842,12 +842,18 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			sendMS(m, fmt.Sprintf("添加白名单失败: %+v", err), nil, 60)
 			return nil
 		}
+
 		if whiteID != 0 {
-			infos.Mutex.Lock()
-			infos.Conf.WhiteIDs = append(infos.Conf.WhiteIDs, whiteID)
-			infos.HasNew = true
-			infos.Mutex.Unlock()
-			sendMS(m, fmt.Sprintf("添加白名单成功: %d", whiteID), nil, 60)
+			if slices.Contains(infos.Conf.WhiteIDs, whiteID) {
+				sendMS(m, fmt.Sprintf("白名单中已存在: %d", whiteID), nil, 60)
+				return nil
+			} else {
+				infos.Mutex.Lock()
+				infos.Conf.WhiteIDs = append(infos.Conf.WhiteIDs, whiteID)
+				infos.HasNew = true
+				infos.Mutex.Unlock()
+				sendMS(m, fmt.Sprintf("添加白名单成功: %d", whiteID), nil, 60)
+			}
 		}
 		return nil
 	case strings.HasPrefix(text, "/disallow"):
@@ -860,21 +866,20 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			sendMS(m, fmt.Sprintf("移除白名单失败: %+v", err), nil, 60)
 			return nil
 		}
+
 		if whiteID != 0 {
-			infos.Mutex.Lock()
-			oldLen := len(infos.Conf.WhiteIDs)
-			infos.Conf.WhiteIDs = slices.DeleteFunc(infos.Conf.WhiteIDs, func(num int64) bool {
-				return num == whiteID
-			})
-			newLen := len(infos.Conf.WhiteIDs)
-			infos.Mutex.Unlock()
-			if oldLen > newLen {
+			if slices.Contains(infos.Conf.WhiteIDs, whiteID) {
 				infos.Mutex.Lock()
+				infos.Conf.WhiteIDs = slices.DeleteFunc(infos.Conf.WhiteIDs, func(num int64) bool {
+					return num == whiteID
+				})
 				infos.HasNew = true
 				infos.Mutex.Unlock()
 				sendMS(m, fmt.Sprintf("移除白名单成功: %d", whiteID), nil, 60)
+				return nil
 			} else {
 				sendMS(m, fmt.Sprintf("用户 %d 不在白名单中", whiteID), nil, 60)
+				return nil
 			}
 		}
 		return nil
@@ -1106,6 +1111,11 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		if channel == "" {
 			sendMS(m, "请提供要添加的频道别名", nil, 60)
 			return nil
+		}
+
+		if slices.Contains(infos.Conf.Channels, channel) {
+			sendMS(m, fmt.Sprintf("频道 %s 已存在", channel), nil, 60)
+			return nil
 		} else {
 			infos.Mutex.Lock()
 			infos.Conf.Channels = append(infos.Conf.Channels, channel)
@@ -1113,6 +1123,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			infos.Mutex.Unlock()
 			sendMS(m, fmt.Sprintf("添加频道成功: %s", channel), nil, 60)
 		}
+
 		return nil
 	case strings.HasPrefix(text, "/del"):
 		if !infos.isAdmin(m.SenderID()) {
@@ -1123,23 +1134,21 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		if channel == "" {
 			sendMS(m, "请提供要移除的频道别名", nil, 60)
 			return nil
+		}
+		
+		if !slices.Contains(infos.Conf.Channels, channel) {
+			sendMS(m, fmt.Sprintf("频道 %s 不在搜索列表中", channel), nil, 60)
+			return nil
 		} else {
 			infos.Mutex.Lock()
-			oldLen := len(infos.Conf.Channels)
 			infos.Conf.Channels = slices.DeleteFunc(infos.Conf.Channels, func(key string) bool {
 				return key == channel
 			})
-			newLen := len(infos.Conf.Channels)
+			infos.HasNew = true
 			infos.Mutex.Unlock()
-			if oldLen > newLen {
-				infos.Mutex.Lock()
-				infos.HasNew = true
-				infos.Mutex.Unlock()
-				sendMS(m, fmt.Sprintf("移除频道成功: %s", channel), nil, 60)
-			} else {
-				sendMS(m, fmt.Sprintf("频道 %s 不在白名单中", channel), nil, 60)
-			}
+			sendMS(m, fmt.Sprintf("移除频道成功: %s", channel), nil, 60)
 		}
+
 		return nil
 	case strings.HasPrefix(text, "/list"):
 		if !infos.isAdmin(m.SenderID()) {

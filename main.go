@@ -686,22 +686,22 @@ func (infos *Infos) checkHash(hash string) int64 {
 	return 0
 }
 
-func (infos *Infos) search(channel, keywords string, page, limit int) (items Items, err error) {
+func (infos *Infos) search(channel, keywords string, page, limit int, offset int32) (items Items, err error) {
 	ch, err := infos.UserClient.ResolvePeer(fmt.Sprintf("@%s", channel))
 	if err != nil {
 		log.Printf("频道解析失败: %+v", err)
 		return items, err
 	}
-
-	var offset int32 = 0
-	offSets.Mutex.Lock()
-	key := fmt.Sprintf("%s|%s|%d", channel, keywords, page)
-	if values, ok := offSets.OffSets[key]; ok && time.Since(values.Time) < time.Hour {
-		offset = values.Offset
-	}
-	offSets.Mutex.Unlock()
-	if page > 1 && offset == 0 {
-		return items, errors.New("未找到匹配消息")
+	if offset == 0 {
+		offSets.Mutex.Lock()
+		key := fmt.Sprintf("%s|%s|%d", channel, keywords, page)
+		if values, ok := offSets.OffSets[key]; ok && time.Since(values.Time) < time.Hour {
+			offset = values.Offset
+		}
+		offSets.Mutex.Unlock()
+		if page > 1 && offset == 0 {
+			return items, errors.New("未找到匹配消息")
+		}
 	}
 
 	ms, err := infos.UserClient.GetMessages(ch, &telegram.SearchOption{
@@ -1135,7 +1135,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			sendMS(m, "请提供要移除的频道别名", nil, 60)
 			return nil
 		}
-		
+
 		if !slices.Contains(infos.Conf.Channels, channel) {
 			sendMS(m, fmt.Sprintf("频道 %s 不在搜索列表中", channel), nil, 60)
 			return nil
@@ -1380,10 +1380,12 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	if err != nil || page <= 0 {
 		page = 1
 	}
-	value = params.Get("limit")
-	if value == "" {
-		value = "20"
+	value = params.Get("offset")
+	offset, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || offset <= 0 {
+		offset = 0
 	}
+
 	limit, err := strconv.Atoi(value)
 	if err != nil || limit <= 0 {
 		limit = 20
@@ -1399,7 +1401,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		channel = strings.TrimPrefix(channel, "@")
 		go func(channel string) {
 			defer count.Add(-1)
-			result, err := infos.search(channel, keywords, page, limit)
+			result, err := infos.search(channel, keywords, page, limit, int32(offset))
 			if err != nil {
 				// log.Printf("搜索失败: %+v", err)
 				return

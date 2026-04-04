@@ -58,7 +58,7 @@ func newTask() *Task {
 // newStream 初始化并返回一个 Stream 对象，负责管理特定文件的流式下载
 func newStream(ctx context.Context, client *telegram.Client, media telegram.MessageMedia, workers int, mid int32, cid int64, name string) *Stream {
 	// 根据并发数动态调整分片大小
-	chunkSize := int64(1024 * 1024)
+	chunkSize := int64(1 * 1024 * 1024)
 	// 默认 32MB 缓存
 	maxCacheSize := infos.Conf.MaxSize
 	if maxCacheSize == 0 {
@@ -108,8 +108,8 @@ func (stream *Stream) start(contentStart, contentEnd int64) {
 
 // download 是工作协程的核心逻辑，负责循环领取并下载文件分片
 func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
-	log.Printf("协程%d开始下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
-	defer log.Printf("协程%d结束下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
+	//log.Printf("协程%d开始下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
+	//defer log.Printf("协程%d结束下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
 	for {
 		stream.Mutex.Lock()
 		task := newTask()
@@ -153,8 +153,12 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 		*stream.TaskEnd = *stream.TaskStart + stream.ChunkSize - 1
 		stream.Mutex.Unlock()
 
-		// 尝试下载该分片，最多重试 3 次
-		for num := 1; num <= 3; num++ {
+		// 尝试下载该分片
+		maxCount := 3
+		if task.ContentStart < int64(1048576) || (contentEnd-task.ContentEnd)/contentEnd*1000 < 2 {
+			maxCount = 6
+		}
+		for num := 1; num <= maxCount; num++ {
 			if waitUntil := infos.WaitUntil.Load(); waitUntil > 0 {
 				if remaining := time.Until(time.Unix(0, waitUntil)); remaining > 0 {
 					log.Printf("协程%d: 检测到FloodWait, 等待 %.2f 秒", numTask, remaining.Seconds())

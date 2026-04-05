@@ -64,11 +64,16 @@ type Item struct {
 	Size int64  `json:"size"`
 }
 
-type MediaCache struct {
+type MediaContent struct {
 	Start   int64
 	End     int64
 	Content []byte
 	Time    time.Time
+}
+
+type MediaCache struct {
+	Contents []MediaContent
+	Time     time.Time
 }
 
 type Items struct {
@@ -1604,11 +1609,14 @@ func mediaCacheKey(cid int64, mid int32) string {
 
 // mediaCacheSizes 根据文件大小计算头部缓存和尾部缓存的大小
 func mediaCacheSizes(size int64) (headSize int64, tailSize int64) {
-	if size < 16*1024*1024 {
+	switch {
+	case size < 2*1024*1024:
+		return
+	case size < 16*1024*1024:
 		count := size / 1024
 		headSize = count / 2 * 1024
 		tailSize = count / 2 * 1024
-	} else {
+	default:
 		headSize = 8 * 1024 * 1024
 		tailSize = 8 * 1024 * 1024
 	}
@@ -1709,7 +1717,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	fileName := src.File.Name
 
 	// 创建新的 Stream 流管理对象
-	stream := newStream(r.Context(), infos.Client, src.Media(), infos.Conf.Workers, mid, cid, fileName)
+	stream := newStream(r.Context(), infos.Client, src.Media(), infos.Conf.Workers, mid, cid, src.File.Size, fileName)
 
 	// 如果是转发的消息，重定向源频道以确保分片下载稳定性
 	if src.Message.FwdFrom != nil {
@@ -1788,7 +1796,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusPartialContent)
 	}
 
-	log.Printf("开始下载: cid=%d, mid=%d, fileName=%s, start=%d, end=%d", cid, mid, fileName, start, end)
+	log.Printf("开始下载: cid=%d, mid=%d, name=%s, start=%d, end=%d", cid, mid, fileName, start, end)
 
 	// 如果是 HEAD 请求，主要供播放器校验流可用性，只返回首部信息后提早结束避免开启流媒体下载协程
 	if r.Method == http.MethodHead {
@@ -1796,77 +1804,12 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 8. 缓存逻辑：检查头部/尾部缓存是否命中，并决定实际下载起点
-	headSize, tailSize := mediaCacheSizes(size)
-	tailStart := size - tailSize // 尾部缓存区间的绝对起始位置
-	cacheKey := mediaCacheKey(cid, mid)
-	downloadStart := start // 实际发给 stream 的起始位置（可能被缓存偏移）
-
-	if r.Method == http.MethodGet {
-		switch {
-		case start < headSize:
-			infos.Mutex.Lock()
-			value, ok := infos.HeadCache[cacheKey]
-			infos.Mutex.Unlock()
-			if ok {
-				cacheSize := int64(len(value.Content))
-				if start < value.Start+cacheSize && start >= value.Start {
-					log.Printf("头部缓存命中: cid=%d, mid=%d, start=%d, end=%d", cid, mid, value.Start, value.End)
-					cacheEnd := end
-					limit := value.Start + cacheSize - 1
-					if cacheEnd > limit {
-						cacheEnd = limit
-					}
-					content := value.Content[start-value.Start : cacheEnd-value.Start+1]
-					if _, err := w.Write(content); err != nil {
-						log.Printf("写入头部缓存时出错: cid=%d, mid=%d, err=%v", cid, mid, err)
-						return
-					}
-					if cacheEnd >= end {
-						// 整个请求范围都被缓存覆盖，直接返回
-						log.Printf("头部缓存完全覆盖请求: cid=%d, mid=%d", cid, mid)
-						return
-					}
-					// 从缓存结束位置之后继续下载
-					downloadStart = cacheEnd + 1
-				}
-			}
-		case start >= tailStart:
-			infos.Mutex.Lock()
-			value, ok := infos.TailCache[cacheKey]
-			infos.Mutex.Unlock()
-			if ok {
-				cacheSize := int64(len(value.Content))
-				if start < value.Start+cacheSize && start >= value.Start {
-					log.Printf("尾部缓存命中: cid=%d, mid=%d, start=%d, end=%d", cid, mid, value.Start, value.End)
-					cacheEnd := end
-					limit := value.Start + cacheSize - 1
-					if cacheEnd > limit {
-						cacheEnd = limit
-					}
-					content := value.Content[start-value.Start : cacheEnd-value.Start+1]
-					if _, err := w.Write(content); err != nil {
-						log.Printf("写入尾部缓存时出错: cid=%d, mid=%d, err=%v", cid, mid, err)
-						return
-					}
-					if cacheEnd >= end {
-						// 整个请求范围都被缓存覆盖，直接返回
-						log.Printf("尾部缓存完全覆盖请求: cid=%d, mid=%d", cid, mid)
-						return
-					}
-					// 从缓存结束位置之后继续下载
-					downloadStart = cacheEnd + 1
-				}
-			}
-
-		}
-	}
+	stream.HeadSize, stream.TailSize = mediaCacheSizes(size)
 
 	// 9. 启动并发下载协程（以调整后的 downloadStart 为起点）
-	actualStart := downloadStart
-	actualEnd := end
-	stream.ContentSize = actualEnd - actualStart + 1
+	// stream.ContentSize = end - start + 1
 
-	go stream.start(actualStart, actualEnd)
+	go stream.start(start, end)
 	defer stream.clean() // 结束时清理
 
 	// 10. 循环从下载管道读取分片并写入 HTTP 响应体
@@ -1876,12 +1819,12 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-r.Context().Done():
 				// 客户端断开连接（如浏览器关闭或拖动进度条导致旧请求作废）
-				log.Printf("流式传输文件已取消: cid=%d, mid=%d, fileName=%s", cid, mid, fileName)
+				log.Printf("流式传输文件已取消: cid=%d, mid=%d, name=%s", cid, mid, fileName)
 				return
 			case task := <-stream.Tasks:
 				// 读取一个下载好的分片任务
 				if task == nil {
-					log.Printf("流式传输文件出错: cid=%d, mid=%d, fileName=%s, error=任务为空", cid, mid, fileName)
+					log.Printf("流式传输文件出错: cid=%d, mid=%d, name=%s, error=任务为空", cid, mid, fileName)
 					continue
 				}
 				// 等待任务标记为 Done
@@ -1892,7 +1835,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				task.Cond.L.Unlock()
 
 				if task.Error != nil {
-					log.Printf("切片下载出错: cid=%d, mid=%d, start=%d, end=%d, fileName=%s, error=%+v", cid, mid, task.ContentStart, task.ContentEnd, fileName, task.Error)
+					log.Printf("切片下载出错: cid=%d, mid=%d, start=%d, end=%d, name=%s, error=%+v", cid, mid, task.ContentStart, task.ContentEnd, fileName, task.Error)
 					return
 				}
 
@@ -1901,76 +1844,6 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				if _, err := w.Write(content); err != nil {
 					log.Printf("写入文件流时出错: cid=%d, mid=%d, err=%v", cid, mid, err)
 				}
-
-				// 收集缓存数据
-				infos.Mutex.Lock()
-				switch {
-				case task.ContentEnd < headSize:
-					if value, ok := infos.HeadCache[cacheKey]; ok {
-						switch {
-						case task.ContentStart <= value.Start && task.ContentEnd >= value.End:
-							value.Content = content
-							value.Start = task.ContentStart
-							value.End = task.ContentEnd
-							value.Time = time.Now()
-							infos.HeadCache[cacheKey] = value
-							log.Printf("头部缓存已更新: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-						case task.ContentStart < value.Start && task.ContentEnd < value.End && task.ContentEnd >= value.Start-1:
-							value.Content = append(content[:value.Start-task.ContentStart], value.Content...)
-							value.Start = task.ContentStart
-							value.Time = time.Now()
-							infos.HeadCache[cacheKey] = value
-							log.Printf("头部缓存已更新: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-						case task.ContentStart <= value.End+1 && task.ContentEnd > value.End:
-							value.Content = append(value.Content, content[(value.End+1)-task.ContentStart:]...)
-							value.End = task.ContentEnd
-							value.Time = time.Now()
-							infos.HeadCache[cacheKey] = value
-							log.Printf("头部缓存已更新: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-						case task.ContentStart >= value.Start && task.ContentEnd <= value.End:
-							value.Time = time.Now()
-							infos.HeadCache[cacheKey] = value
-							log.Printf("头部缓存已刷新: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-						}
-					} else {
-						evictOldestCache(infos.HeadCache, 4)
-						infos.HeadCache[cacheKey] = MediaCache{Start: task.ContentStart, End: task.ContentEnd, Content: content, Time: time.Now()}
-						log.Printf("头部缓存已存储: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-					}
-				case task.ContentStart >= size-tailSize:
-					if value, ok := infos.TailCache[cacheKey]; ok {
-						switch {
-						case task.ContentStart <= value.Start && task.ContentEnd >= value.End:
-							value.Content = content
-							value.Start = task.ContentStart
-							value.End = task.ContentEnd
-							value.Time = time.Now()
-							infos.TailCache[cacheKey] = value
-							log.Printf("尾部缓存已更新: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-						case task.ContentStart < value.Start && task.ContentEnd < value.End && task.ContentEnd >= value.Start-1:
-							value.Content = append(content[:value.Start-task.ContentStart], value.Content...)
-							value.Start = task.ContentStart
-							value.Time = time.Now()
-							infos.TailCache[cacheKey] = value
-							log.Printf("尾部缓存已更新: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-						case task.ContentStart <= value.End+1 && task.ContentEnd > value.End:
-							value.Content = append(value.Content, content[(value.End+1)-task.ContentStart:]...)
-							value.End = task.ContentEnd
-							value.Time = time.Now()
-							infos.TailCache[cacheKey] = value
-							log.Printf("尾部缓存已更新: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-						case task.ContentStart >= value.Start && task.ContentEnd <= value.End:
-							value.Time = time.Now()
-							infos.TailCache[cacheKey] = value
-							log.Printf("尾部缓存已刷新: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-						}
-					} else {
-						evictOldestCache(infos.TailCache, 4)
-						infos.TailCache[cacheKey] = MediaCache{Start: task.ContentStart, End: task.ContentEnd, Content: content, Time: time.Now()}
-						log.Printf("尾部缓存已存储: cid=%d, mid=%d, start=%d, end=%d", cid, mid, task.ContentStart, task.ContentEnd)
-					}
-				}
-				infos.Mutex.Unlock()
 
 				// 检查是否已经写完当前请求的所有范围
 				if task.ContentEnd >= end {

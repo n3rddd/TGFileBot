@@ -35,6 +35,8 @@ type Stream struct {
 	ChunkSize    int64                  // 每个下载分片的大小（通常 512KB 或 1MB）
 	ContentSize  int64                  // 文件的总大小
 	MaxCacheSize int64                  // 最大缓存大小
+	HeadSize     int64                  // 头部缓存大小
+	TailSize     int64                  // 尾部缓存大小
 	TaskStart    *int64                 // 当前已分配任务的下载起点
 	TaskEnd      *int64                 // 当前已分配任务的下载终点
 	FileName     string                 // 文件名
@@ -56,7 +58,7 @@ func newTask() *Task {
 }
 
 // newStream 初始化并返回一个 Stream 对象，负责管理特定文件的流式下载
-func newStream(ctx context.Context, client *telegram.Client, media telegram.MessageMedia, workers int, mid int32, cid int64, name string) *Stream {
+func newStream(ctx context.Context, client *telegram.Client, media telegram.MessageMedia, workers int, mid int32, cid, contentSize int64, name string) *Stream {
 	// 根据并发数动态调整分片大小
 	chunkSize := int64(1 * 1024 * 1024)
 	// 默认 32MB 缓存
@@ -77,6 +79,7 @@ func newStream(ctx context.Context, client *telegram.Client, media telegram.Mess
 		FileName:     name,
 		MID:          mid,
 		CID:          cid,
+		ContentSize:  contentSize,
 		ChunkSize:    chunkSize, // 这里设置了固定值，可以根据需要调整
 		MaxCacheSize: maxCacheSize,
 		Tasks:        make(chan *Task, maxChans),
@@ -108,8 +111,7 @@ func (stream *Stream) start(contentStart, contentEnd int64) {
 
 // download 是工作协程的核心逻辑，负责循环领取并下载文件分片
 func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
-	//log.Printf("协程%d开始下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
-	//defer log.Printf("协程%d结束下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
+	cacheKey := mediaCacheKey(stream.CID, stream.MID)
 	for {
 		stream.Mutex.Lock()
 		task := newTask()
@@ -144,7 +146,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 				// 成功发送任务
 			default:
 				// 任务队列已满，这里保持阻塞直到能存入或取消
-				log.Printf("任务队列已满: cid=%d, mid=%d, fileName=%s", stream.CID, stream.MID, stream.FileName)
+				log.Printf("任务队列已满: cid=%d, mid=%d, name=%s", stream.CID, stream.MID, stream.FileName)
 				stream.Tasks <- task
 			}
 		}
@@ -158,14 +160,21 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 		if task.ContentStart < int64(1048576) || (contentEnd-task.ContentEnd)/contentEnd*1000 < 2 {
 			maxCount = 6
 		}
+
 		for num := 1; num <= maxCount; num++ {
+			// 从缓存读取
+			found := stream.handleCache(task, cacheKey, contentEnd)
+			if found {
+				break
+			}
+
+			// 下载
 			if waitUntil := infos.WaitUntil.Load(); waitUntil > 0 {
 				if remaining := time.Until(time.Unix(0, waitUntil)); remaining > 0 {
 					log.Printf("协程%d: 检测到FloodWait, 等待 %.2f 秒", numTask, remaining.Seconds())
 					time.Sleep(remaining)
 				}
 			}
-
 			version := stream.Version.Load()
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
 			content, fileName, err := stream.Client.DownloadChunk(*stream.Src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, 90*time.Second)
@@ -173,7 +182,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 				switch {
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
 					// 如果报错文件引用过期，则调用 refresh 重新获取消息并更新引用
-					log.Printf("文件引用已过期: cid=%d, mid=%d, version=%d, fileName=%s, numTask=%d", stream.CID, stream.MID, version, fileName, numTask)
+					log.Printf("文件引用已过期: cid=%d, mid=%d, version=%d, name=%s, numTask=%d", stream.CID, stream.MID, version, fileName, numTask)
 					if err := stream.refresh(numTask, version); err != nil {
 						task.Error = err
 						task.Cond.L.Lock()
@@ -192,31 +201,103 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 				task.Cond.Signal()
 				task.Cond.L.Unlock()
 				return
-			} else {
-				task.Cond.L.Lock()
-				// 根据初始偏移量截取内容
-				content = content[task.Offset:]
-				// 裁剪末尾：最后一个分片可能超出实际请求范围（contentEnd），
-				// 防止写入 HTTP 响应时超过声明的 Content-Length
-				if task.ContentEnd > contentEnd {
-					overshoot := task.ContentEnd - contentEnd
-					if int64(len(content)) > overshoot {
-						content = content[:int64(len(content))-overshoot]
-					}
-					task.ContentEnd = contentEnd
-				}
-				if task.Content == nil {
-					task.Content = &content
-				} else {
-					*task.Content = content
-				}
-				*task.Done = true
-				task.Cond.Signal() // 唤醒等待此分片的协程
-				task.Cond.L.Unlock()
-				break
 			}
+
+			// 缓存
+			infos.Mutex.Lock()
+			switch {
+			case task.ContentStart <= stream.HeadSize && task.ContentEnd <= stream.HeadSize:
+				if values, ok := infos.HeadCache[cacheKey]; ok {
+					values.Time = time.Now()
+					values.Contents = append(values.Contents, MediaContent{
+						Start:   task.ContentStart,
+						End:     task.ContentEnd,
+						Content: content,
+					})
+					infos.HeadCache[cacheKey] = values
+				}
+			case task.ContentStart >= stream.ContentSize-stream.TailSize && task.ContentEnd <= stream.ContentSize:
+				if values, ok := infos.TailCache[cacheKey]; ok {
+					values.Time = time.Now()
+					values.Contents = append(values.Contents, MediaContent{
+						Start:   task.ContentStart,
+						End:     task.ContentEnd,
+						Content: content,
+					})
+					infos.TailCache[cacheKey] = values
+				}
+			}
+			infos.Mutex.Unlock()
+
+			task.handleContent(content, contentEnd)
+			break
 		}
 	}
+}
+
+func (task *Task) handleContent(content []byte, contentEnd int64) {
+	// 处理数据
+	task.Cond.L.Lock()
+	// 根据初始偏移量截取内容
+	content = content[task.Offset:]
+	// 裁剪末尾：最后一个分片可能超出实际请求范围（contentEnd），
+	// 防止写入 HTTP 响应时超过声明的 Content-Length
+	if task.ContentEnd > contentEnd {
+		overshoot := task.ContentEnd - contentEnd
+		if int64(len(content)) > overshoot {
+			content = content[:int64(len(content))-overshoot]
+		}
+		task.ContentEnd = contentEnd
+	}
+	if task.Content == nil {
+		task.Content = &content
+	} else {
+		*task.Content = content
+	}
+	*task.Done = true
+	task.Cond.Signal() // 唤醒等待此分片的协程
+	task.Cond.L.Unlock()
+}
+
+func (stream *Stream) handleCache(task *Task, cacheKey string, contentEnd int64) (found bool) {
+	infos.Mutex.Lock()
+	defer infos.Mutex.Unlock()
+	// 从缓存读取
+	switch {
+	case task.ContentStart <= stream.HeadSize && task.ContentEnd <= stream.HeadSize:
+		if values, ok := infos.HeadCache[cacheKey]; ok {
+			for _, value := range values.Contents {
+				if value.Start == task.ContentStart && value.End == task.ContentEnd {
+					log.Printf("命中头部缓存: cid=%d, mid=%d, name=%s, start=%d, end=%d", stream.CID, stream.MID, stream.FileName, task.ContentStart, task.ContentEnd)
+					task.handleContent(value.Content, contentEnd)
+					return true
+				}
+			}
+		} else {
+			evictOldestCache(infos.HeadCache, 4)
+			contents := make([]MediaContent, 0, int(stream.HeadSize/stream.ChunkSize))
+			infos.HeadCache[cacheKey] = MediaCache{Contents: contents, Time: time.Now()}
+			log.Printf("头部缓存已初始化: cid=%d, mid=%d", stream.CID, stream.MID)
+			return false
+		}
+	case task.ContentStart >= stream.ContentSize-stream.TailSize && task.ContentEnd <= stream.ContentSize-1:
+		if values, ok := infos.TailCache[cacheKey]; ok {
+			for _, value := range values.Contents {
+				if value.Start == task.ContentStart && value.End == task.ContentEnd {
+					log.Printf("命中尾部缓存: cid=%d, mid=%d, name=%s, start=%d, end=%d", stream.CID, stream.MID, stream.FileName, task.ContentStart, task.ContentEnd)
+					task.handleContent(value.Content, contentEnd)
+					return true
+				}
+			}
+		} else {
+			evictOldestCache(infos.TailCache, 4)
+			contents := make([]MediaContent, 0, int(stream.TailSize/stream.ChunkSize))
+			infos.TailCache[cacheKey] = MediaCache{Contents: contents, Time: time.Now()}
+			log.Printf("尾部缓存已初始化: cid=%d, mid=%d", stream.CID, stream.MID)
+			return false
+		}
+	}
+	return false
 }
 
 // clean 清理未完成或已读取的任务管道，防止内存泄漏

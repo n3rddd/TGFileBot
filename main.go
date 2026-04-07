@@ -1899,6 +1899,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				content := *task.Content
 				if _, err := w.Write(content); err != nil {
 					log.Printf("写入文件流时出错: cid=%d, mid=%d, err=%v", cid, mid, err)
+					return
 				}
 
 				// 检查是否已经写完当前请求的所有范围
@@ -1909,7 +1910,6 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				task = nil
 			}
 		}
-
 	}
 }
 

@@ -460,6 +460,9 @@ func (infos *Infos) startBot() (err error) {
 		}
 
 		for _, adminID := range infos.Conf.AdminIDs {
+			if adminID == infos.Conf.UserID {
+				continue
+			}
 			userID, err := client.ResolvePeer(adminID)
 			if err != nil {
 				log.Printf("解析用户 ID 失败: %v", err)

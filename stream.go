@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -15,14 +14,13 @@ import (
 
 // Task 代表一个下载分片任务
 type Task struct {
-	Offset       int64      // 任务在分片内的偏移量
-	ContentStart int64      // 任务请求的数据起点（绝对位置）
-	ContentEnd   int64      // 任务请求的数据终点（绝对位置）
-	Version      int64      // 任务对应的文件版本号，用于处理引用过期
-	Error        error      // 下载过程中产生的错误
-	Done         *bool      // 标记任务是否完成
-	Cond         *sync.Cond // 用于通知等待该任务完成的协程
-	Content      *[]byte    // 下载到的二进制内容
+	Offset       int64         // 任务在分片内的偏移量
+	ContentStart int64         // 任务请求的数据起点（绝对位置）
+	ContentEnd   int64         // 任务请求的数据终点（绝对位置）
+	Version      int64         // 任务对应的文件版本号，用于处理引用过期
+	Error        error         // 下载过程中产生的错误
+	Done         chan struct{} // 用于通知该任务完成
+	Content      []byte        // 下载到的二进制内容
 }
 
 // Stream 结构体用于管理大文件的并发下载和流式传输
@@ -51,10 +49,8 @@ type Stream struct {
 // newTask 初始化并返回一个 Task 对象
 func newTask() *Task {
 	return &Task{
-		Error:   nil,
-		Done:    new(bool),
-		Content: new([]byte),
-		Cond:    sync.NewCond(new(sync.Mutex)),
+		Error: nil,
+		Done:  make(chan struct{}),
 	}
 }
 
@@ -95,7 +91,7 @@ func newStream(ctx context.Context, client *telegram.Client, media telegram.Mess
 // start 启动工作协程开始下载任务
 func (stream *Stream) start(contentStart, contentEnd int64) {
 	// 计算任务总数
-	maxTasks := int(math.Ceil(float64(contentEnd-contentStart+1) / float64(stream.ChunkSize)))
+	maxTasks := int((contentEnd - contentStart + 1 + stream.ChunkSize - 1) / stream.ChunkSize)
 	// 限制并发协程数不超过配置值
 	if maxTasks > stream.Workers {
 		maxTasks = stream.Workers
@@ -180,23 +176,18 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
 			content, fileName, err := stream.Client.DownloadChunk(*stream.Src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, 90*time.Second)
 			if err != nil {
-				switch {
-				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
+				if telegram.MatchError(err, "FILE_REFERENCE_EXPIRED") {
 					// 如果报错文件引用过期，则调用 refresh 重新获取消息并更新引用
 					log.Printf("文件引用已过期: cid=%d, mid=%d, version=%d, name=%s, numTask=%d", stream.CID, stream.MID, version, fileName, numTask)
 					if err := stream.refresh(numTask, version); err != nil {
 						task.Error = err
-						task.Cond.L.Lock()
-						*task.Done = true
-						task.Cond.Signal()
-						task.Cond.L.Unlock()
+						close(task.Done)
 						return
 					}
 					// 刷新成功后继续重试当前分片
 					continue
-				case infos.Rex.MatchString(err.Error()):
+				} else if matches := infos.Rex.FindStringSubmatch(err.Error()); len(matches) > 0 {
 					wait := 3
-					matches := infos.Rex.FindStringSubmatch(err.Error())
 					if len(matches) > 1 {
 						for _, match := range matches[1:] {
 							if match != "" {
@@ -215,12 +206,10 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 					time.Sleep(time.Duration(wait+1) * time.Second)
 					continue
 				}
+
 				// 遇到其他不可恢复错误，终止下载
 				task.Error = err
-				task.Cond.L.Lock()
-				*task.Done = true
-				task.Cond.Signal()
-				task.Cond.L.Unlock()
+				close(task.Done)
 				return
 			}
 
@@ -230,22 +219,46 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 			case task.ContentStart <= stream.HeadSize && task.ContentEnd <= stream.HeadSize:
 				if values, ok := infos.HeadCache[cacheKey]; ok {
 					values.Time = time.Now()
-					values.Contents = append(values.Contents, MediaContent{
-						Start:   task.ContentStart,
-						End:     task.ContentEnd,
-						Content: content,
-					})
-					infos.HeadCache[cacheKey] = values
+					found := false
+					for _, c := range values.Contents {
+						if c.Start == task.ContentStart && c.End == task.ContentEnd {
+							found = true
+							break
+						}
+					}
+					if !found {
+						if len(values.Contents) > 32 {
+							values.Contents = values.Contents[1:]
+						}
+						values.Contents = append(values.Contents, MediaContent{
+							Start:   task.ContentStart,
+							End:     task.ContentEnd,
+							Content: content,
+						})
+						infos.HeadCache[cacheKey] = values
+					}
 				}
 			case task.ContentStart >= stream.ContentSize-stream.TailSize:
 				if values, ok := infos.TailCache[cacheKey]; ok {
 					values.Time = time.Now()
-					values.Contents = append(values.Contents, MediaContent{
-						Start:   task.ContentStart,
-						End:     task.ContentEnd,
-						Content: content,
-					})
-					infos.TailCache[cacheKey] = values
+					found := false
+					for _, c := range values.Contents {
+						if c.Start == task.ContentStart && c.End == task.ContentEnd {
+							found = true
+							break
+						}
+					}
+					if !found {
+						if len(values.Contents) > 32 {
+							values.Contents = values.Contents[1:]
+						}
+						values.Contents = append(values.Contents, MediaContent{
+							Start:   task.ContentStart,
+							End:     task.ContentEnd,
+							Content: content,
+						})
+						infos.TailCache[cacheKey] = values
+					}
 				}
 			}
 			infos.Mutex.Unlock()
@@ -257,8 +270,6 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 }
 
 func (task *Task) handleContent(content []byte, contentEnd int64) {
-	// 处理数据
-	task.Cond.L.Lock()
 	// 根据初始偏移量截取内容
 	content = content[task.Offset:]
 	actualStart := task.ContentStart + task.Offset
@@ -273,14 +284,8 @@ func (task *Task) handleContent(content []byte, contentEnd int64) {
 		task.ContentEnd = contentEnd
 	}
 
-	if task.Content == nil {
-		task.Content = &content
-	} else {
-		*task.Content = content
-	}
-	*task.Done = true
-	task.Cond.Signal() // 唤醒等待此分片的协程
-	task.Cond.L.Unlock()
+	task.Content = content
+	close(task.Done) // 唤醒等待此分片的协程
 }
 
 func (stream *Stream) handleCache(task *Task, cacheKey string, contentEnd int64) (found bool) {
@@ -335,11 +340,12 @@ func (stream *Stream) clean() {
 		case task := <-stream.Tasks:
 			if task != nil {
 				// 等待任务完成后再释放，避免与下载协程产生 data race
-				task.Cond.L.Lock()
-				for !*task.Done {
-					task.Cond.Wait()
+				// 加入超时保护，防止 panic 或未 close(Done) 带来的永久死锁
+				select {
+				case <-task.Done:
+				case <-time.After(2 * time.Second):
+					log.Printf("清理任务时遇到阻塞过长，强制丢弃: start=%d end=%d", task.ContentStart, task.ContentEnd)
 				}
-				task.Cond.L.Unlock()
 				task.Content = nil
 				task = nil
 			}

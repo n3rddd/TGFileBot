@@ -75,13 +75,10 @@ func saveConf(conf *Conf, filesPath string) error {
 		return err
 	}
 
-	// 将字节数组写入到配置文件
-	// 注意：这里使用了 defer 来执行写入操作，但在实际逻辑中建议直接写入。
-	// 原代码逻辑保持不变：在 defer 中执行 WriteFile
-	defer func() {
-		if err := os.WriteFile(configPath, bytes, 0644); err != nil {
-			log.Printf("写入 config.json 文件错误: %+v", err)
-		}
-	}()
+	// 将字节数组写入到配置文件并返回结果
+	if err := os.WriteFile(configPath, bytes, 0644); err != nil {
+		log.Printf("写入 config.json 文件错误: %+v", err)
+		return err
+	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -83,7 +84,7 @@ type Infos struct {
 	BotClient  *telegram.Client      // 独立的 Bot 客户端（用于与用户交互）
 	UserClient *telegram.Client      // 全局 UserBot 客户端实例（用于读取私有内容和流式传输）
 	Client     *telegram.Client      // 当前活跃客户端指针
-	Mutex      *sync.Mutex           // 全局互斥锁, 保护并发安全
+	Mutex      *sync.RWMutex         // 全局互斥锁, 保护并发安全
 	Conf       *Conf                 // 指向全局配置
 	File       *os.File              // 日志文件句柄
 	Rex        *regexp.Regexp        // 用于解析 Telegram FloodWait 错误的正则
@@ -174,25 +175,26 @@ func main() {
 	signal.Ignore(syscall.SIGPIPE)
 
 	// 设置系统中断信号监听, 用于优雅退出
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	statusChan := make(chan os.Signal, 1)
+	signal.Notify(statusChan, os.Interrupt, syscall.SIGTERM)
+
+	// 创建 HTTP 服务器
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%d", infos.Conf.Port),
+		Handler:           http.HandlerFunc(handleMain),
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       600 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 最大头部字节数 (1MB)
+	}
 
 	// 6. 在独立协程中启动 HTTP 服务
 	go func() {
 		log.Printf("HTTP 服务运行在 %d 端口", infos.Conf.Port)
-		server := &http.Server{
-			Addr:              fmt.Sprintf(":%d", infos.Conf.Port),
-			Handler:           http.HandlerFunc(handleMain),
-			ReadTimeout:       30 * time.Second,
-			ReadHeaderTimeout: 10 * time.Second,
-			// WriteTimeout:   60 * time.Second, // 禁用写入超时, 允许长时间流式传输
-			IdleTimeout:    600 * time.Second,
-			MaxHeaderBytes: 1 << 20, // 最大头部字节数 (1MB)
-		}
 
 		if err := server.ListenAndServe(); err != nil {
 			log.Printf("HTTP 服务启动失败: %+v", err)
-			sigChan <- os.Interrupt
+			statusChan <- os.Interrupt
 		}
 	}()
 
@@ -206,8 +208,17 @@ func main() {
 	}
 
 	// 阻塞等待直到接收到退出信号
-	sig := <-sigChan
-	log.Printf("收到信号: %v, 正在退出...", sig)
+	status := <-statusChan
+	log.Printf("收到信号: %v, 正在退出...", status)
+
+	// 设置关闭的超时时间，例如 10 秒
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("HTTP 服务关闭异常: %+v", err)
+	} else {
+		log.Printf("HTTP 服务已优雅关闭")
+	}
 	sendMS(nil, "程序已退出", nil, 60)
 }
 
@@ -216,7 +227,7 @@ func newInfos(filePath, filesPath string) (*Infos, error) {
 	infos := &Infos{
 		FilePath:  filePath,
 		FilesPath: filesPath,
-		Mutex:     new(sync.Mutex),
+		Mutex:     new(sync.RWMutex),
 		Code:      make(chan string, 1),
 		Pass:      make(chan string, 1),
 		HeadCache: make(map[string]MediaCache, 4),

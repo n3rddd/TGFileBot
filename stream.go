@@ -231,16 +231,19 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 					}
 					if !found {
 						// maxChunks = HeadSize / ChunkSize，即头部最多能存几个分片
-						maxChunks := int(stream.HeadSize/stream.ChunkSize) + 1
-						if len(values.Contents) >= maxChunks {
+						maxChunks := int((stream.HeadSize+stream.ChunkSize-1)/stream.ChunkSize) + 1
+						lenContents := len(values.Contents)
+						if lenContents >= maxChunks {
 							// 淡出策略：保留靠近文件头的分片，删除 Start 最大的（距开头最远、最冗余）
 							maxNum := 0
-							for num := 1; num < len(values.Contents); num++ {
+							for num := 1; num < lenContents; num++ {
 								if values.Contents[num].Start > values.Contents[maxNum].Start {
 									maxNum = num
 								}
 							}
-							values.Contents = append(values.Contents[:maxNum], values.Contents[maxNum+1:]...)
+							values.Contents[maxNum] = values.Contents[lenContents-1]
+							values.Contents[lenContents-1] = MediaContent{}
+							values.Contents = values.Contents[:lenContents-1]
 						}
 						values.Contents = append(values.Contents, MediaContent{
 							Start:   task.ContentStart,
@@ -262,16 +265,19 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 					}
 					if !found {
 						// maxChunks = TailSize / ChunkSize，即尾部最多能存几个分片
-						maxChunks := int(stream.TailSize/stream.ChunkSize) + 1
-						if len(values.Contents) >= maxChunks {
+						maxChunks := int((stream.TailSize+stream.ChunkSize-1)/stream.ChunkSize) + 1
+						lenContents := len(values.Contents)
+						if lenContents >= maxChunks {
 							// 淡出策略：保留靠近文件尾的分片，删除 Start 最小的（距结尾最远、最冗余）
 							minNum := 0
-							for num := 1; num < len(values.Contents); num++ {
+							for num := 1; num < lenContents; num++ {
 								if values.Contents[num].Start < values.Contents[minNum].Start {
 									minNum = num
 								}
 							}
-							values.Contents = append(values.Contents[:minNum], values.Contents[minNum+1:]...)
+							values.Contents[minNum] = values.Contents[lenContents-1]
+							values.Contents[lenContents-1] = MediaContent{}
+							values.Contents = values.Contents[:lenContents-1]
 						}
 						values.Contents = append(values.Contents, MediaContent{
 							Start:   task.ContentStart,

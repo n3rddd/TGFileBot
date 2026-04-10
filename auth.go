@@ -40,8 +40,8 @@ func (infos *Infos) buildIDs() {
 }
 
 func (infos *Infos) isAdmin(id int64) bool {
-	infos.Mutex.Lock()
-	defer infos.Mutex.Unlock()
+	infos.Mutex.RLock()
+	defer infos.Mutex.RUnlock()
 	if value, ok := infos.IDs[id]; ok {
 		return value.IsAdmin
 	}
@@ -49,8 +49,8 @@ func (infos *Infos) isAdmin(id int64) bool {
 }
 
 func (infos *Infos) isWhite(id int64) bool {
-	infos.Mutex.Lock()
-	defer infos.Mutex.Unlock()
+	infos.Mutex.RLock()
+	defer infos.Mutex.RUnlock()
 	if value, ok := infos.IDs[id]; ok {
 		return value.IsWhite
 	}

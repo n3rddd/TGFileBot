@@ -315,14 +315,15 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	channels := make([]string, len(infos.Conf.Channels))
 	copy(channels, infos.Conf.Channels)
 	infos.Mutex.RUnlock() // 读取完立即解锁
+
 	results := make(chan Items, len(channels))
 
+	maxCount := int64(2 * infos.Conf.Workers)
+	if maxCount == 0 {
+		maxCount = 3
+	}
+
 	for _, channel := range channels {
-		maxCount := int64(2 * infos.Conf.Workers)
-		if maxCount == 0 {
-			maxCount = 3
-		}
-		
 		infos.Cond.L.Lock()
 		for count.Load() >= maxCount {
 			infos.Cond.Wait()
@@ -333,6 +334,14 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		channel = strings.TrimPrefix(channel, "@")
 		go func(channel string) {
 			defer count.Add(-1)
+
+			if waitUntil := infos.WaitUntil.Load(); waitUntil > 0 {
+				if remaining := time.Until(time.Unix(waitUntil, 0)); remaining > 0 {
+					log.Printf("搜索: 检测到FloodWait, 等待 %.2f 秒", remaining.Seconds())
+					time.Sleep(remaining)
+				}
+			}
+			
 			result, err := infos.search(channel, keywords, page, limit, int32(offset))
 			if err != nil {
 				return

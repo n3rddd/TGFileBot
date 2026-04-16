@@ -311,13 +311,24 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	count := atomic.Int64{}
-	infos.Mutex.Lock() // 加锁保护读取过程
+	infos.Mutex.RLock() // 加锁保护读取过程
 	channels := make([]string, len(infos.Conf.Channels))
 	copy(channels, infos.Conf.Channels)
-	infos.Mutex.Unlock() // 读取完立即解锁
+	infos.Mutex.RUnlock() // 读取完立即解锁
 	results := make(chan Items, len(channels))
 
 	for _, channel := range channels {
+		maxCount := int64(2 * infos.Conf.Workers)
+		if maxCount == 0 {
+			maxCount = 3
+		}
+		
+		infos.Cond.L.Lock()
+		for count.Load() >= maxCount {
+			infos.Cond.Wait()
+		}
+		infos.Cond.L.Unlock()
+
 		count.Add(1)
 		channel = strings.TrimPrefix(channel, "@")
 		go func(channel string) {
@@ -341,7 +352,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		Items   []Items `json:"items"`
 	}
 
-	items.Items = make([]Items, 0, len(infos.Conf.Channels))
+	items.Items = make([]Items, 0, len(channels))
 	defer func() {
 		content, err := json.Marshal(items)
 		if err != nil {

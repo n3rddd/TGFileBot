@@ -85,6 +85,7 @@ type Infos struct {
 	UserClient *telegram.Client      // 全局 UserBot 客户端实例（用于读取私有内容和流式传输）
 	Client     *telegram.Client      // 当前活跃客户端指针
 	Mutex      *sync.RWMutex         // 全局互斥锁, 保护并发安全
+	Cond       *sync.Cond            // 条件变量, 用于等待
 	Conf       *Conf                 // 指向全局配置
 	File       *os.File              // 日志文件句柄
 	Rex        *regexp.Regexp        // 用于解析 Telegram FloodWait 错误的正则

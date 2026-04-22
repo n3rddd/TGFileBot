@@ -102,8 +102,16 @@ func (infos *Infos) startBot() (err error) {
 				Description: "移除搜索频道",
 			},
 			{
+				Command:     "addRule",
+				Description: "添加关键词规则",
+			},
+			{
+				Command:     "delRule",
+				Description: "移除关键词规则",
+			},
+			{
 				Command:     "list",
-				Description: "列出搜索频道或白名单",
+				Description: "列出搜索频道、白名单、关键词规则",
 			},
 			{
 				Command:     "info",

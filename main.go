@@ -99,6 +99,7 @@ type Infos struct {
 	IDs        map[int64]ID          // 缓存用户 ID 到哈希的映射, 减少重复计算
 	HeadCache  map[string]MediaCache // 缓存文件头部数据
 	TailCache  map[string]MediaCache // 缓存文件尾部数据
+	RegexRules []*regexp.Regexp      // 预编译的群管正则规则缓存
 }
 
 var infos *Infos
@@ -267,6 +268,7 @@ func newInfos(filePath, filesPath string) (*Infos, error) {
 	infos.Conf = conf
 	infos.IDs = make(map[int64]ID, len(conf.AdminIDs)+len(conf.WhiteIDs)+1)
 	infos.buildIDs()
+	infos.buildRegex()
 
 	// 获取 BotID
 	if conf.BotToken != "" {
@@ -290,4 +292,23 @@ func newOffSets() *OffSets {
 		Mutex:   new(sync.Mutex),
 		OffSets: make(map[string]OffSet),
 	}
+}
+
+// buildRegex 预编译正则规则并缓存到 infos.RegexRules
+func (infos *Infos) buildRegex() {
+	infos.Mutex.Lock()
+	defer infos.Mutex.Unlock()
+	infos.RegexRules = make([]*regexp.Regexp, 0, len(infos.Conf.Rules))
+	for _, rule := range infos.Conf.Rules {
+		if rule == "" {
+			continue
+		}
+		r, err := regexp.Compile(rule)
+		if err != nil {
+			log.Printf("正则规则编译失败 [%s]: %+v", rule, err)
+			continue
+		}
+		infos.RegexRules = append(infos.RegexRules, r)
+	}
+	log.Printf("成功预编译 %d 条正则规则", len(infos.RegexRules))
 }

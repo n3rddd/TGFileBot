@@ -81,25 +81,25 @@ type ID struct {
 
 // Infos 结构体保存了程序运行时的全局状态和资源句柄
 type Infos struct {
-	BotClient  *telegram.Client      // 独立的 Bot 客户端（用于与用户交互）
-	UserClient *telegram.Client      // 全局 UserBot 客户端实例（用于读取私有内容和流式传输）
-	Client     *telegram.Client      // 当前活跃客户端指针
-	Mutex      *sync.RWMutex         // 全局互斥锁, 保护并发安全
-	Cond       *sync.Cond            // 条件变量, 用于等待
-	Conf       *Conf                 // 指向全局配置
-	File       *os.File              // 日志文件句柄
-	Rex        *regexp.Regexp        // 用于解析 Telegram FloodWait 错误的正则
-	RexRules   []*regexp.Regexp      // 预编译的群管正则规则缓存
-	FilesPath  string                // 配置文件存放目录
-	FilePath   string                // 日志文件路径
-	BotID      int64                 // Bot 自身的 ID
-	Status     atomic.Int32          // UserBot 登录状态: 0 未登录, 1 等待验证码, 2 等待二步验证, 3 已登录
-	WaitUntil  atomic.Int64          // 等待结束时间
-	Code       chan string           // 用于接收异步提交的验证码
-	Pass       chan string           // 用于接收异步提交的二步验证密码
-	IDs        map[int64]ID          // 缓存用户 ID 到哈希的映射, 减少重复计算
-	HeadCache  map[string]MediaCache // 缓存文件头部数据
-	TailCache  map[string]MediaCache // 缓存文件尾部数据
+	BotClient  *telegram.Client       // 独立的 Bot 客户端（用于与用户交互）
+	UserClient *telegram.Client       // 全局 UserBot 客户端实例（用于读取私有内容和流式传输）
+	Client     *telegram.Client       // 当前活跃客户端指针
+	Mutex      *sync.RWMutex          // 全局互斥锁, 保护并发安全
+	Cond       *sync.Cond             // 条件变量, 用于等待
+	Conf       *Conf                  // 指向全局配置
+	File       *os.File               // 日志文件句柄
+	Rex        *regexp.Regexp         // 用于解析 Telegram FloodWait 错误的正则
+	RexRules   []*regexp.Regexp       // 预编译的群管正则规则缓存
+	FilesPath  string                 // 配置文件存放目录
+	FilePath   string                 // 日志文件路径
+	BotID      int64                  // Bot 自身的 ID
+	Status     atomic.Int32           // UserBot 登录状态: 0 未登录, 1 等待验证码, 2 等待二步验证, 3 已登录
+	WaitUntil  atomic.Int64           // 等待结束时间
+	Code       chan string            // 用于接收异步提交的验证码
+	Pass       chan string            // 用于接收异步提交的二步验证密码
+	IDs        map[int64]ID           // 缓存用户 ID 到哈希的映射, 减少重复计算
+	HeadCache  map[string]*MediaCache // 缓存文件头部数据
+	TailCache  map[string]*MediaCache // 缓存文件尾部数据
 }
 
 var infos *Infos
@@ -234,8 +234,8 @@ func newInfos(filePath, filesPath string) (*Infos, error) {
 		Cond:      sync.NewCond(mutex),
 		Code:      make(chan string, 1),
 		Pass:      make(chan string, 1),
-		HeadCache: make(map[string]MediaCache, 4),
-		TailCache: make(map[string]MediaCache, 4),
+		HeadCache: make(map[string]*MediaCache, 4),
+		TailCache: make(map[string]*MediaCache, 4),
 		Rex:       regexp.MustCompile(`(?i)(?:FLOOD(?:_PREMIUM)?_WAIT_(\d+)|WAIT(?:\s+OF)?\s*(\d+))`),
 	}
 	// 启动配置自动保存监听

@@ -168,6 +168,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 			maxCount = 6
 		}
 
+		maxWait := 3
 		for num := 1; num <= maxCount; num++ {
 			// 从缓存读取
 			found := stream.handleCache(task, cacheKey, contentEnd)
@@ -184,12 +185,12 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 			}
 			version := stream.Version.Load()
 			stream.Mutex.Lock()
-			srcCopy := *stream.Src
+			src := *stream.Src
 			stream.Mutex.Unlock()
 
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
 			// 将超时时间从 90s 缩短至 10s 以解决冷启动 TCP 连接假死的问题 [BUG-001]
-			content, fileName, err := stream.Client.DownloadChunk(srcCopy, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, 10*time.Second)
+			content, fileName, err := stream.Client.DownloadChunk(src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, 10*time.Second)
 			if err != nil {
 				switch {
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
@@ -221,21 +222,24 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 							infos.WaitUntil.Store(waitUntil.Unix())
 						}
 						time.Sleep(time.Duration(wait+1) * time.Second)
+						if num >= maxCount && maxWait > 0 {
+							num = maxCount - 1
+							maxWait--
+						}
 						continue
 					} else {
 						if num < maxCount {
 							backoff := time.Duration(1<<num) * time.Second // 2s, 4s, 8s...
-							log.Printf("协程%d: 网络错误重试 (%d/%d), 等待 %v. 错误: %v", numTask, num, maxCount, backoff, err)
+							log.Printf("协程%d: 网络错误重试 %d/%d, 等待 %v. 错误: %+v", numTask, num, maxCount, backoff, err)
 							time.Sleep(backoff)
 							continue
+						} else {
+							task.Error = err
+							close(task.Done)
+							return
 						}
 					}
 				}
-
-				// 遇到其他不可恢复错误, 终止下载
-				task.Error = err
-				close(task.Done)
-				return
 			}
 
 			// 缓存
@@ -244,7 +248,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 				switch {
 				case task.ContentStart <= stream.HeadSize && task.ContentEnd <= stream.HeadSize:
 					if values, ok := infos.HeadCache[cacheKey]; ok {
-						values.Time = time.Now()
+						values.Time = time.Now() // 指针类型，直接修改即生效
 						found := false
 						for _, c := range values.Contents {
 							if c.Start == task.ContentStart && c.End == task.ContentEnd {
@@ -253,11 +257,11 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 							}
 						}
 						if !found {
-							// maxChunks = HeadSize / ChunkSize，即头部最多能存几个分片
+							// maxChunks = HeadSize / ChunkSize, 即头部最多能存几个分片
 							maxChunks := int((stream.HeadSize+stream.ChunkSize-1)/stream.ChunkSize) + 1
 							lenContents := len(values.Contents)
 							if lenContents >= maxChunks {
-								// 淡出策略：保留靠近文件头的分片，删除 Start 最大的（距开头最远、最冗余）
+								// 淡出策略：保留靠近文件头的分片, 删除 Start 最大的（距开头最远、最冗余）
 								maxNum := 0
 								for num := 1; num < lenContents; num++ {
 									if values.Contents[num].Start > values.Contents[maxNum].Start {
@@ -273,12 +277,11 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 								End:     task.ContentEnd,
 								Content: content,
 							})
-							infos.HeadCache[cacheKey] = values
 						}
 					}
 				case task.ContentStart >= stream.ContentSize-stream.TailSize:
 					if values, ok := infos.TailCache[cacheKey]; ok {
-						values.Time = time.Now()
+						values.Time = time.Now() // 指针类型，直接修改即生效
 						found := false
 						for _, c := range values.Contents {
 							if c.Start == task.ContentStart && c.End == task.ContentEnd {
@@ -287,11 +290,11 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 							}
 						}
 						if !found {
-							// maxChunks = TailSize / ChunkSize，即尾部最多能存几个分片
+							// maxChunks = TailSize / ChunkSize, 即尾部最多能存几个分片
 							maxChunks := int((stream.TailSize+stream.ChunkSize-1)/stream.ChunkSize) + 1
 							lenContents := len(values.Contents)
 							if lenContents >= maxChunks {
-								// 淡出策略：保留靠近文件尾的分片，删除 Start 最小的（距结尾最远、最冗余）
+								// 淡出策略：保留靠近文件尾的分片, 删除 Start 最小的（距结尾最远、最冗余）
 								minNum := 0
 								for num := 1; num < lenContents; num++ {
 									if values.Contents[num].Start < values.Contents[minNum].Start {
@@ -307,7 +310,6 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 								End:     task.ContentEnd,
 								Content: content,
 							})
-							infos.TailCache[cacheKey] = values
 						}
 					}
 				}
@@ -316,6 +318,13 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 
 			task.handleContent(content, contentEnd)
 			break
+		}
+
+		// 检查循环退出后是否成功
+		if task.Content == nil && task.Error == nil {
+			task.Error = fmt.Errorf("下载失败, 已达最大重试次数: %d", maxCount)
+			close(task.Done)
+			return
 		}
 	}
 }
@@ -356,7 +365,7 @@ func (stream *Stream) handleCache(task *Task, cacheKey string, contentEnd int64)
 		} else {
 			evictOldestCache(infos.HeadCache, 4)
 			contents := make([]MediaContent, 0, int(stream.HeadSize/stream.ChunkSize))
-			infos.HeadCache[cacheKey] = MediaCache{Contents: contents, Time: time.Now()}
+			infos.HeadCache[cacheKey] = &MediaCache{Contents: contents, Time: time.Now()}
 			log.Printf("头部缓存已初始化: cid=%d, mid=%d", stream.CID, stream.MID)
 			return false
 		}
@@ -372,7 +381,7 @@ func (stream *Stream) handleCache(task *Task, cacheKey string, contentEnd int64)
 		} else {
 			evictOldestCache(infos.TailCache, 4)
 			contents := make([]MediaContent, 0, int(stream.TailSize/stream.ChunkSize))
-			infos.TailCache[cacheKey] = MediaCache{Contents: contents, Time: time.Now()}
+			infos.TailCache[cacheKey] = &MediaCache{Contents: contents, Time: time.Now()}
 			log.Printf("尾部缓存已初始化: cid=%d, mid=%d", stream.CID, stream.MID)
 			return false
 		}

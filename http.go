@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,8 +58,8 @@ func handleMain(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// parseStreamParams 解析流式下载请求参数
-func parseStreamParams(r *http.Request) (cid int64, mid int32, cate string, err error) {
+// handleStreamParams 解析流式下载请求参数
+func handleStreamParams(r *http.Request) (cid int64, mid int32, cate string, err error) {
 	params := r.URL.Query()
 	if err = checkPass(params); err != nil {
 		return 0, 0, "", err
@@ -89,13 +90,13 @@ func parseStreamParams(r *http.Request) (cid int64, mid int32, cate string, err 
 	return cid, mid, cate, nil
 }
 
-// parseRangeHeader 解析 HTTP Range 头
-func parseRangeHeader(rangeHeader string, size int64) (start, end int64) {
-	if rangeHeader == "" {
+// handleRanHeader 解析 HTTP Range 头
+func handleRanHeader(src string, size int64) (start, end int64) {
+	if src == "" {
 		return 0, size - 1
 	}
-	rangeStr := strings.TrimSpace(strings.TrimPrefix(rangeHeader, "bytes="))
-	parts := strings.SplitN(rangeStr, "-", 2)
+	src = strings.TrimSpace(strings.TrimPrefix(src, "bytes="))
+	parts := strings.SplitN(src, "-", 2)
 	if len(parts) == 2 {
 		if parts[0] == "" {
 			suffixLength, err := strconv.ParseInt(parts[1], 10, 64)
@@ -145,7 +146,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1-2. 获取 URL 参数、完成身份校验、解析频道 ID 和消息 ID
-	cid, mid, cate, err := parseStreamParams(r)
+	cid, mid, cate, err := handleStreamParams(r)
 	if err != nil {
 		if err.Error() == "频道ID无效" || err.Error() == "消息ID无效" {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -203,10 +204,10 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, fileName))
 
 	// 7. 处理 HTTP Range 请求（分段读取的核心逻辑）
-	rangeHeader := r.Header.Get("Range")
-	start, end := parseRangeHeader(rangeHeader, size)
+	ranHeader := r.Header.Get("Range")
+	start, end := handleRanHeader(ranHeader, size)
 
-	if rangeHeader == "" {
+	if ranHeader == "" {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
 	} else {
@@ -323,6 +324,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	infos.Mutex.RUnlock() // 读取完立即解锁
 
 	results := make(chan Items, len(channels))
+	var workerPool sync.WaitGroup
 
 	maxCount := int64(2 * infos.Conf.Workers)
 	if maxCount == 0 {
@@ -330,7 +332,6 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, channel := range channels {
-
 		infos.Cond.L.Lock()
 		for count.Load() >= maxCount {
 			infos.Cond.Wait()
@@ -338,14 +339,10 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		infos.Cond.L.Unlock()
 
 		count.Add(1)
+		workerPool.Add(1)
 		channel = strings.TrimPrefix(channel, "@")
 		go func(channel string) {
-			defer func() {
-				count.Add(-1)
-				infos.Cond.L.Lock()
-				infos.Cond.Broadcast()
-				infos.Cond.L.Unlock()
-			}()
+			defer workerPool.Done()
 
 			result, err := infos.search(channel, keywords, page, limit, int32(offset))
 			if err != nil {
@@ -355,11 +352,15 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 			case <-ctx.Done():
 				return
 			case results <- result:
-			default:
-				log.Print("搜索通道已满")
 			}
 		}(channel)
 	}
+
+	// 启动一个协程，在所有任务完成后关闭通道
+	go func() {
+		workerPool.Wait()
+		close(results)
+	}()
 
 	var items struct {
 		HasMore bool    `json:"more"`
@@ -385,16 +386,15 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
-		case result := <-results:
+		case result, ok := <-results:
+			if !ok {
+				return
+			}
 			if len(result.Item) > 0 {
 				items.Items = append(items.Items, result)
 			}
 			if !items.HasMore && result.HasMore {
 				items.HasMore = result.HasMore
-			}
-		default:
-			if count.Load() == 0 {
-				return
 			}
 		}
 	}
@@ -492,7 +492,7 @@ func mediaCacheSizes(size int64) (headSize int64, tailSize int64) {
 }
 
 // evictOldestCache 当 cache map 超过 maxCount 时删除最旧的一条
-func evictOldestCache(cache map[string]MediaCache, maxCount int) {
+func evictOldestCache(cache map[string]*MediaCache, maxCount int) {
 	if len(cache) <= maxCount {
 		return
 	}

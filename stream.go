@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -190,11 +191,16 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
 			// 将超时时间从 90s 缩短至 10s 以解决冷启动 TCP 连接假死的问题 [BUG-001]
-			timeout := time.Duration(5 * num) * time.Second
+			timeout := time.Duration(5*num) * time.Second
 
 			content, fileName, err := stream.Client.DownloadChunk(src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, timeout)
 			if err != nil {
 				switch {
+				// 如果 context 已经关闭（手动取消或整体超时），则彻底停止任务
+				case stream.Ctx.Err() != nil, errors.Is(err, context.Canceled):
+					task.Error = err
+					close(task.Done)
+					return
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
 					// 如果报错文件引用过期, 则调用 refresh 重新获取消息并更新引用
 					log.Printf("文件引用已过期: cid=%d, mid=%d, version=%d, name=%s, numTask=%d", stream.CID, stream.MID, version, fileName, numTask)
@@ -331,66 +337,6 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 	}
 }
 
-func (task *Task) handleContent(content []byte, contentEnd int64) {
-	// 根据初始偏移量截取内容
-	content = content[task.Offset:]
-	actualStart := task.ContentStart + task.Offset
-
-	// 裁剪末尾：最后一个分片可能超出实际请求范围（contentEnd）,
-	// 防止写入 HTTP 响应时超过声明的 Content-Length
-	if task.ContentEnd > contentEnd {
-		wantedLen := contentEnd - actualStart + 1
-		if wantedLen > 0 && int64(len(content)) > wantedLen {
-			content = content[:wantedLen]
-		}
-		task.ContentEnd = contentEnd
-	}
-
-	task.Content = content
-	close(task.Done) // 唤醒等待此分片的协程
-}
-
-func (stream *Stream) handleCache(task *Task, cacheKey string, contentEnd int64) (found bool) {
-	infos.Mutex.Lock()
-	defer infos.Mutex.Unlock()
-	// 从缓存读取
-	switch {
-	case task.ContentStart <= stream.HeadSize && task.ContentEnd <= stream.HeadSize:
-		if values, ok := infos.HeadCache[cacheKey]; ok {
-			for _, value := range values.Contents {
-				if value.Start == task.ContentStart && value.End == task.ContentEnd {
-					log.Printf("命中头部缓存: cid=%d, mid=%d, name=%s, start=%d, end=%d", stream.CID, stream.MID, stream.FileName, task.ContentStart, task.ContentEnd)
-					task.handleContent(value.Content, contentEnd)
-					return true
-				}
-			}
-		} else {
-			evictOldestCache(infos.HeadCache, 4)
-			contents := make([]MediaContent, 0, int(stream.HeadSize/stream.ChunkSize))
-			infos.HeadCache[cacheKey] = &MediaCache{Contents: contents, Time: time.Now()}
-			log.Printf("头部缓存已初始化: cid=%d, mid=%d", stream.CID, stream.MID)
-			return false
-		}
-	case task.ContentStart >= stream.ContentSize-stream.TailSize:
-		if values, ok := infos.TailCache[cacheKey]; ok {
-			for _, value := range values.Contents {
-				if value.Start == task.ContentStart && value.End == task.ContentEnd {
-					log.Printf("命中尾部缓存: cid=%d, mid=%d, name=%s, start=%d, end=%d", stream.CID, stream.MID, stream.FileName, task.ContentStart, task.ContentEnd)
-					task.handleContent(value.Content, contentEnd)
-					return true
-				}
-			}
-		} else {
-			evictOldestCache(infos.TailCache, 4)
-			contents := make([]MediaContent, 0, int(stream.TailSize/stream.ChunkSize))
-			infos.TailCache[cacheKey] = &MediaCache{Contents: contents, Time: time.Now()}
-			log.Printf("尾部缓存已初始化: cid=%d, mid=%d", stream.CID, stream.MID)
-			return false
-		}
-	}
-	return false
-}
-
 // clean 清理未完成或已读取的任务管道, 防止内存泄漏
 func (stream *Stream) clean() {
 	// 创建计时器, 避免死循环
@@ -466,4 +412,64 @@ func (stream *Stream) refresh(numTask int, version int64) (err error) {
 	stream.Version.Add(1) // 递增版本号
 	log.Printf("文件引用已刷新: cid=%d, mid=%d, numTask=%d, version=%d, newVersion=%d", stream.CID, stream.MID, numTask, version, stream.Version.Load())
 	return nil
+}
+
+func (task *Task) handleContent(content []byte, contentEnd int64) {
+	// 根据初始偏移量截取内容
+	content = content[task.Offset:]
+	actualStart := task.ContentStart + task.Offset
+
+	// 裁剪末尾：最后一个分片可能超出实际请求范围（contentEnd）,
+	// 防止写入 HTTP 响应时超过声明的 Content-Length
+	if task.ContentEnd > contentEnd {
+		wantedLen := contentEnd - actualStart + 1
+		if wantedLen > 0 && int64(len(content)) > wantedLen {
+			content = content[:wantedLen]
+		}
+		task.ContentEnd = contentEnd
+	}
+
+	task.Content = content
+	close(task.Done) // 唤醒等待此分片的协程
+}
+
+func (stream *Stream) handleCache(task *Task, cacheKey string, contentEnd int64) (found bool) {
+	infos.Mutex.Lock()
+	defer infos.Mutex.Unlock()
+	// 从缓存读取
+	switch {
+	case task.ContentStart <= stream.HeadSize && task.ContentEnd <= stream.HeadSize:
+		if values, ok := infos.HeadCache[cacheKey]; ok {
+			for _, value := range values.Contents {
+				if value.Start == task.ContentStart && value.End == task.ContentEnd {
+					log.Printf("命中头部缓存: cid=%d, mid=%d, name=%s, start=%d, end=%d", stream.CID, stream.MID, stream.FileName, task.ContentStart, task.ContentEnd)
+					task.handleContent(value.Content, contentEnd)
+					return true
+				}
+			}
+		} else {
+			evictOldestCache(infos.HeadCache, 4)
+			contents := make([]MediaContent, 0, int(stream.HeadSize/stream.ChunkSize))
+			infos.HeadCache[cacheKey] = &MediaCache{Contents: contents, Time: time.Now()}
+			log.Printf("头部缓存已初始化: cid=%d, mid=%d", stream.CID, stream.MID)
+			return false
+		}
+	case task.ContentStart >= stream.ContentSize-stream.TailSize:
+		if values, ok := infos.TailCache[cacheKey]; ok {
+			for _, value := range values.Contents {
+				if value.Start == task.ContentStart && value.End == task.ContentEnd {
+					log.Printf("命中尾部缓存: cid=%d, mid=%d, name=%s, start=%d, end=%d", stream.CID, stream.MID, stream.FileName, task.ContentStart, task.ContentEnd)
+					task.handleContent(value.Content, contentEnd)
+					return true
+				}
+			}
+		} else {
+			evictOldestCache(infos.TailCache, 4)
+			contents := make([]MediaContent, 0, int(stream.TailSize/stream.ChunkSize))
+			infos.TailCache[cacheKey] = &MediaCache{Contents: contents, Time: time.Now()}
+			log.Printf("尾部缓存已初始化: cid=%d, mid=%d", stream.CID, stream.MID)
+			return false
+		}
+	}
+	return false
 }

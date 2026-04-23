@@ -317,6 +317,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
+
 	count := atomic.Int64{}
 	infos.Mutex.RLock() // 加锁保护读取过程
 	channels := make([]string, len(infos.Conf.Channels))
@@ -342,7 +343,13 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		workerPool.Add(1)
 		channel = strings.TrimPrefix(channel, "@")
 		go func(channel string) {
-			defer workerPool.Done()
+			defer func() {
+				workerPool.Done()
+				count.Add(-1)
+				infos.Cond.L.Lock()
+				infos.Cond.Broadcast()
+				infos.Cond.L.Unlock()
+			}()
 
 			result, err := infos.search(channel, keywords, page, limit, int32(offset))
 			if err != nil {

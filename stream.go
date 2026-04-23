@@ -198,7 +198,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 				switch {
 				// 如果 context 已经关闭（手动取消或整体超时），则彻底停止任务
 				case stream.Ctx.Err() != nil, errors.Is(err, context.Canceled):
-					task.Error = err
+					task.Error = errors.New("已取消下载任务")
 					close(task.Done)
 					return
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):

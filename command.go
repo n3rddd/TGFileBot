@@ -72,7 +72,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			} else {
 				src = "仅限内部使用, 请保管好你的HASH密码与UID"
 			}
-			sendMS(m, src, nil, 60)
+			sendMS(m, src, nil)
 			return nil
 		case strings.HasPrefix(text, "/allow"):
 			if !infos.isAdmin(m.SenderID()) {

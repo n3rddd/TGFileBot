@@ -235,7 +235,8 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// 10. 循环从下载管道读取分片并写入 HTTP 响应体
 	if r.Method == http.MethodGet {
-		timer := time.NewTimer(30 * time.Second)
+		// 首个分片给更长超时，容忍冷启动 Telegram 连接重建延迟
+		timer := time.NewTimer(60 * time.Second)
 		defer timer.Stop()
 		for {
 			select {

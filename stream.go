@@ -166,12 +166,15 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 
 		// 尝试下载该分片
 		maxCount := 3
+		firstChunk := task.ContentStart <= contentStart+stream.ChunkSize
 		if task.ContentStart < int64(1048576) || (contentEnd-task.ContentEnd)/contentEnd*1000 < 2 {
 			maxCount = 6
 		}
 
 		maxWait := 3
-		maxTimeoutRetries := 2 // TCP 超时免费重试次数（不计入 maxCount）
+		if firstChunk {
+			maxWait = 4 // 首个分片给更多免费重试，容忍冷启动延迟
+		}
 		for num := 1; num <= maxCount; num++ {
 			// 从缓存读取
 			found := stream.handleCache(task, cacheKey, contentEnd)
@@ -192,7 +195,11 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 			stream.Mutex.Unlock()
 
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
+			// 首次尝试给更长超时，容忍冷启动 TCP 连接重建 + TLS + MTProto 认证
 			timeout := 8 * time.Second
+			if firstChunk && num == 1 {
+				timeout = 16 * time.Second
+			}
 
 			content, fileName, err := stream.Client.DownloadChunk(src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, timeout)
 			if err != nil {
@@ -215,10 +222,16 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 				case strings.Contains(errStr, "deadline exceeded") ||
 					strings.Contains(errStr, "initialize worker: timeout") ||
 					strings.Contains(errStr, "get worker: timeout"):
-					log.Printf("协程%d: TCP连接超时 %d/%d, 错误: %v", numTask, num, maxCount, err)
-					time.Sleep(500 * time.Millisecond)
-					if maxTimeoutRetries > 0 {
-						maxTimeoutRetries--
+					// 渐进重试间隔：500ms, 1s, 1.5s, 2s...
+					backoffMs := 500 * num
+					if backoffMs > 3000 {
+						backoffMs = 3000
+					}
+					backoff := time.Duration(backoffMs) * time.Millisecond
+					log.Printf("协程%d: TCP连接超时 %d/%d, 错误: %v, 等待 %.2f 秒后重试", numTask, num, maxCount, err, backoff.Seconds())
+					time.Sleep(backoff)
+					if maxWait > 0 {
+						maxWait--
 						num-- // 抵消 for 循环的 num++, 不计入重试次数
 					}
 					continue
@@ -241,15 +254,19 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 							infos.WaitUntil.Store(waitUntil.Unix())
 						}
 						time.Sleep(time.Duration(wait+1) * time.Second)
-						if num >= maxCount && maxWait > 0 {
+						if maxWait > 0 {
 							num = maxCount - 1
-							maxWait--
+							num-- // 抵消 for 循环的 num++, 不计入重试次数
 						}
 						continue
 					} else {
 						if num < maxCount {
-							backoff := time.Duration(1<<num) * time.Second // 2s, 4s, 8s...
-							log.Printf("协程%d: 网络错误重试 %d/%d, 等待 %v. 错误: %+v", numTask, num, maxCount, backoff, err)
+							backoffMs := 500 * num
+							if backoffMs > 3000 {
+								backoffMs = 3000
+							}
+							backoff := time.Duration(backoffMs) * time.Millisecond
+							log.Printf("协程%d: 网络错误重试 %d/%d, 等待 %.2f 秒后重试. 错误: %+v", numTask, num, maxCount, backoff.Seconds(), err)
 							time.Sleep(backoff)
 							continue
 						} else {

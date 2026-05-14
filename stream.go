@@ -101,12 +101,6 @@ func newStream(ctx context.Context, client *telegram.Client, media telegram.Mess
 
 // start 启动工作协程开始下载任务
 func (stream *Stream) start(contentStart, contentEnd int64) {
-	// 下载前预热连接
-	if err := stream.warmConnection(stream.Ctx); err != nil {
-		log.Printf("唤醒TCP连接失败: %+v", err)
-		return
-	}
-
 	// 计算任务总数
 	maxTasks := int((contentEnd - contentStart + 1 + stream.ChunkSize - 1) / stream.ChunkSize)
 	// 限制并发协程数不超过配置值
@@ -512,24 +506,27 @@ func (stream *Stream) warmConnection(ctx context.Context) error {
 	defer cancel()
 
 	// 最轻量探活 RPC
-	_, err := stream.Client.Ping(warmCtx)
+	latenc, err := stream.Client.Ping(warmCtx)
 	if err != nil {
-		log.Printf("预热TCP失败: %+v", err)
+		log.Printf("TCP 链路异常, 正在重连: %+v", err)
 		// 强制断开
-		if value := stream.Client.Disconnect(); value != nil {
-			log.Printf("强制断开TCP连接失败: %+v", value)
+		if err := stream.Client.Disconnect(); err != nil {
+			log.Printf("强制断开 TCP 连接失败: %+v", err)
 		}
 		// 重连
-		if value := stream.Client.Connect(); value != nil {
-			log.Printf("重连TCP失败: %+v", value)
-			return value
+		if err := stream.Client.Connect(); err != nil {
+			log.Printf("重连 TCP 失败: %+v", err)
+			return err
 		}
 		// 重连后再次验证
-		if _, value := stream.Client.Ping(warmCtx); value != nil {
-			log.Printf("重连TCP后验证失败: %+v", value)
-			return value
+		if value, err := stream.Client.Ping(warmCtx); err != nil {
+			log.Printf("重连 TCP 后验证失败: %+v", err)
+			return err
+		} else {
+			log.Printf("TCP 链路已恢复, 延迟: %.2fs", value.Seconds())
 		}
 	}
-	log.Printf("预热TCP成功")
+	
+	log.Printf("TCP 链路正常, 延迟: %.2fs", latenc.Seconds())
 	return nil
 }

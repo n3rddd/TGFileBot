@@ -185,6 +185,12 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	// 创建新的 Stream 流管理对象
 	stream := newStream(r.Context(), infos.Client, src.Media(), infos.Conf.Workers, mid, cid, src.File.Size, fileName)
 
+	// 唤醒TCP连接
+	if err := stream.warmConnection(stream.Ctx); err != nil {
+		log.Printf("唤醒TCP连接失败: %+v", err)
+		return
+	}
+
 	// 如果是转发的消息, 重定向源频道以确保分片下载稳定性
 	if src.Message.FwdFrom != nil {
 		if ch, ok := src.Message.FwdFrom.FromID.(*telegram.PeerChannel); ok {

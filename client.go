@@ -398,6 +398,16 @@ func (infos *Infos) checkStatus() (err error) {
 
 // resetStatus 断开 UserBot 连接并清理 session/cache, 将状态重置为未登录
 func (infos *Infos) resetStatus() {
+	// 排空可能残留的旧验证码/密码
+	select {
+	case <-infos.Code:
+	default:
+	}
+	select {
+	case <-infos.Pass:
+	default:
+	}
+
 	// 1. 断开连接并清理句柄
 	if err := infos.UserClient.Disconnect(); err != nil {
 		log.Printf("UserBot 断开连接失败: %+v", err)
@@ -439,25 +449,35 @@ func (infos *Infos) code() (code string, err error) {
 // submitCode 接收用户通过 Bot 发送的验证码并写入通道
 func (infos *Infos) submitCode(str string) (err error) {
 	infos.Mutex.Lock()
-	defer infos.Mutex.Unlock()
 
 	if infos.Status.Load() != 1 {
+		infos.Mutex.Unlock()
 		err = errors.New("当前状态不是等待验证码")
-		sendMS(nil, err.Error(), nil, 60)
 		return err
 	}
 
 	// 过滤非数字字符
 	var sb strings.Builder
 	for _, r := range str {
-		if isDigit(r) {
+		if isNumber(r) {
 			sb.WriteRune(r)
 		}
 	}
 
 	code := sb.String()
-	infos.Code <- code
-	return nil
+	infos.Mutex.Unlock() // 发送前解锁，允许阻塞但不会死锁全局
+
+	timeout := time.NewTimer(2 * time.Minute)
+	defer timeout.Stop()
+	
+	select {
+	case infos.Code <- code:
+		return nil
+	case <-timeout.C:
+		err = errors.New("等待验证码超时")
+		infos.Status.Store(0) // 流程失败，重置为未登录状态
+		return err
+	}
 }
 
 // pass 是登录回调, 暂停协程等待用户通过 Bot 发送 2FA 密码
@@ -478,7 +498,7 @@ func (infos *Infos) pass() (pass string, err error) {
 	case <-timeout.C:
 		err = errors.New("等待2FA密码超时")
 		sendMS(nil, err.Error(), nil, 60)
-		infos.Status.Store(1)
+		infos.Status.Store(0) // 流程失败，重置为未登录状态
 		return "", err
 	}
 }
@@ -486,15 +506,25 @@ func (infos *Infos) pass() (pass string, err error) {
 // submitPass 接收用户通过 Bot 发送的 2FA 密码并写入通道
 func (infos *Infos) submitPass(pass string) (err error) {
 	infos.Mutex.Lock()
-	defer infos.Mutex.Unlock()
 
 	if infos.Status.Load() != 2 {
+		infos.Mutex.Unlock()
 		err = errors.New("当前状态不是等待2FA密码")
-		sendMS(nil, err.Error(), nil, 60)
 		return err
 	}
-	infos.Pass <- pass
-	return nil
+	infos.Mutex.Unlock() // 发送前解锁，允许阻塞但不会死锁全局
+
+	timeout := time.NewTimer(2 * time.Minute)
+	defer timeout.Stop()
+	
+	select {
+	case infos.Pass <- pass:
+		return nil
+	case <-timeout.C:
+		err = errors.New("等待2FA密码超时")
+		infos.Status.Store(0) // 流程失败，重置为未登录状态
+		return err
+	}
 }
 
 // wakeTCP 预热连接，防止冷启动卡死

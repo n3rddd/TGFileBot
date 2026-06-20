@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // handleTime 将秒数格式化为人类可读的时间字符串
@@ -194,4 +195,44 @@ func GetClientIP(r *http.Request) string {
 
 	// 4. 所有方式失败时返回默认值
 	return "未知IP"
+}
+
+// evictOldestCache 当 cache map 超过 maxCount 时删除最旧的一条
+func evictOldestCache(cache map[string]*MediaCache, maxCount int) {
+	if len(cache) <= maxCount {
+		return
+	}
+	var oldestKey string
+	var oldestTime time.Time
+	for k, v := range cache {
+		if oldestKey == "" || v.Time.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = v.Time
+		}
+	}
+	if oldestKey != "" {
+		delete(cache, oldestKey)
+		log.Printf("媒体缓存已淘汰最旧条目: key=%s", oldestKey)
+	}
+}
+
+// mediaCacheKey 生成缓存 key
+func mediaCacheKey(cid int64, mid int32) string {
+	return fmt.Sprintf("%d:%d", cid, mid)
+}
+
+// mediaCacheSizes 根据文件大小计算头部缓存和尾部缓存的大小
+func mediaCacheSizes(size int64) (headSize int64, tailSize int64) {
+	switch {
+	case size < 2*1024*1024:
+		return
+	case size < 16*1024*1024:
+		count := size / 1024
+		headSize = count / 2 * 1024
+		tailSize = count / 2 * 1024
+	default:
+		headSize = 8 * 1024 * 1024
+		tailSize = 8 * 1024 * 1024
+	}
+	return
 }

@@ -40,16 +40,16 @@ func handleMain(w http.ResponseWriter, r *http.Request) {
 			log.Printf("发送网页失败: %+v", err)
 		}
 		return
-	case path == "/search":
-		// 处理搜索
-		handleSearch(w, r)
-		return
 	case path == "/pic":
 		handlePic(w, r)
 		return
 	case path == "/link":
 		// 处理链接直链提取并跳转
 		handleLink(w, r)
+		return
+	case path == "/search":
+		// 处理搜索
+		handleSearch(w, r)
 		return
 	case strings.HasPrefix(path, "/stream"):
 		// 处理文件分片流式下载（串流播放）核心接口
@@ -540,16 +540,19 @@ func handleLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientIP := GetClientIP(r)
+	log.Printf("正在处理来自 %s 的请求, 开始提取直链, link=%s", clientIP, src)
+
 	// 3. 正则匹配并解析链接
-	re := regexp.MustCompile(`t\.me\/(c\/(\d+)|([a-zA-Z0-9_]+))\/(\d+)(?:\?.*comment=(\d+))?`)
-	matches := re.FindAllStringSubmatch(src, -1)
-	res.Matches = matches
+	re := regexp.MustCompile(`t\.me\/(c\/(\d+)|([a-zA-Z0-9_]+))\/(\d+)(?:.*comment=(\d+))?(?:.*o=([-+]?\d+))?`)
+	res.Matches = re.FindAllStringSubmatch(src, -1)
 	value := params.Get("uid")
-	var err error
-	res.UID, err = strconv.ParseInt(value, 10, 64)
+
+	uid, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		log.Printf("转换UID错误: %+v", err)
 	}
+	res.UID = uid
 	res.Pass = params.Get("key")
 	res.Hash = params.Get("hash")
 
@@ -589,45 +592,5 @@ func handleMediaCate(fileName string) string {
 		return "video/mp4"
 	default:
 		return "application/octet-stream"
-	}
-}
-
-// mediaCacheKey 生成缓存 key
-func mediaCacheKey(cid int64, mid int32) string {
-	return fmt.Sprintf("%d:%d", cid, mid)
-}
-
-// mediaCacheSizes 根据文件大小计算头部缓存和尾部缓存的大小
-func mediaCacheSizes(size int64) (headSize int64, tailSize int64) {
-	switch {
-	case size < 2*1024*1024:
-		return
-	case size < 16*1024*1024:
-		count := size / 1024
-		headSize = count / 2 * 1024
-		tailSize = count / 2 * 1024
-	default:
-		headSize = 8 * 1024 * 1024
-		tailSize = 8 * 1024 * 1024
-	}
-	return
-}
-
-// evictOldestCache 当 cache map 超过 maxCount 时删除最旧的一条
-func evictOldestCache(cache map[string]*MediaCache, maxCount int) {
-	if len(cache) <= maxCount {
-		return
-	}
-	var oldestKey string
-	var oldestTime time.Time
-	for k, v := range cache {
-		if oldestKey == "" || v.Time.Before(oldestTime) {
-			oldestKey = k
-			oldestTime = v.Time
-		}
-	}
-	if oldestKey != "" {
-		delete(cache, oldestKey)
-		log.Printf("媒体缓存已淘汰最旧条目: key=%s", oldestKey)
 	}
 }

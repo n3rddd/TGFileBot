@@ -25,6 +25,7 @@ import (
 type HackLink struct {
 	M       *telegram.NewMessage // 原始消息对象
 	UID     int64                // 发起请求的用户 ID
+	Offset  int32                // 偏移量
 	Pass    string               // 可选密码
 	Hash    string               // 验证哈希
 	Matches [][]string           // 正则匹配到的链接信息

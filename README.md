@@ -265,6 +265,7 @@ docker run -d --name tgfilebot -p 8080:8080 -v $(pwd)/files:/root/files tgfilebo
 | `page` | 否 | 页码，默认 `1` |
 | `limit` | 否 | 每页返回数量，默认 `20` |
 | `offset` | 否 | 结果偏移ID，用于翻页，默认 `0` |
+| `filter` | 否 | 过滤文件大小，如 `10M`，仅返回大于此大小的文件，默认 `128K` |
 | `key` / `hash` / `uid` | 否* | 鉴权参数（同上）|
 
 **响应示例**:

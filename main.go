@@ -82,6 +82,7 @@ type MediaCache struct {
 
 type Items struct {
 	HasMore bool   `json:"more"`
+	ID      string `json:"id"`
 	Channel string `json:"channel"`
 	Item    []Item `json:"item"`
 }

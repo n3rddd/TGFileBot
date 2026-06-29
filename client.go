@@ -689,9 +689,9 @@ func (infos *Infos) list(channel string, page, limit int, filter int64) (items I
 			items.Channel = strings.TrimSpace(m.Channel.Title)
 		}
 
-		name := strings.TrimSpace(m.File.Name)
+		name := strings.TrimSpace(m.Text())
 		if name == "" {
-			name = strings.TrimSpace(m.Text())
+			name = strings.TrimSpace(m.File.Name)
 		}
 		name = strings.ReplaceAll(name, "_", "")
 
@@ -704,6 +704,7 @@ func (infos *Infos) list(channel string, page, limit int, filter int64) (items I
 	}
 	if len(items.Item) > 0 {
 		items.HasMore = true
+		items.ID = channel
 	}
 	return items, nil
 }
@@ -809,10 +810,11 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 				items.Channel = strings.TrimSpace(m.Channel.Title)
 			}
 
-			name := strings.TrimSpace(m.File.Name)
+			name := strings.TrimSpace(m.Text())
 			if name == "" {
-				name = strings.TrimSpace(m.Text())
+				name = strings.TrimSpace(m.File.Name)
 			}
+			name = strings.ReplaceAll(name, "_", "")
 
 			items.Item = append(items.Item, Item{
 				Name: name,
@@ -824,6 +826,7 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 	}
 	if len(items.Item) > 0 {
 		items.HasMore = true
+		items.ID = channel
 	}
 
 	return items, nil

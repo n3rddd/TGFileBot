@@ -193,9 +193,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 			// 首次尝试给更长超时，容忍冷启动 TCP 连接重建 + TLS + MTProto 认证
 			timeout := 8 * time.Second
 
-			ctx, cancel := context.WithTimeout(stream.Ctx, timeout)
-			content, fileName, err := stream.Client.DownloadChunk(src, int(task.ContentStart), int(task.ContentEnd)+1, int(chunkSize), false, ctx, timeout)
-			cancel()
+			content, fileName, err := stream.Client.DownloadChunk(src, int(task.ContentStart), int(task.ContentEnd)+1, int(chunkSize), false, stream.Ctx, timeout)
 			if err != nil {
 				errStr := strings.ToLower(err.Error())
 				switch {

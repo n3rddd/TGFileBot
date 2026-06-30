@@ -127,6 +127,12 @@ func handleParams(r *http.Request) (result Params, err error) {
 	}
 	result.MID = int32(mid)
 
+	reverse, err := strconv.ParseBool(params.Get("reverse"))
+	if err != nil || !reverse {
+		reverse = false
+	}
+	result.Reverse = reverse
+
 	result.Filter = convertSize(params.Get("filter"))
 	return result, nil
 }
@@ -295,7 +301,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 	items.Items = make([]Items, 0, len(params.Channels))
 
 	for _, channel := range params.Channels {
-		item, err := infos.list(channel, params.Page, params.Limit, params.Filter)
+		item, err := infos.list(channel, params.Page, params.Limit, params.Filter, params.Reverse)
 		if err != nil {
 			log.Printf("获取频道 %s 的文件列表失败: %+v", channel, err)
 			continue
@@ -561,7 +567,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 				infos.Cond.L.Unlock()
 			}()
 
-			result, err := infos.search(channel, keywords, page, limit, int32(offset), params.Filter)
+			result, err := infos.search(channel, keywords, page, limit, int32(offset), params.Filter, params.Reverse)
 			if err != nil {
 				return
 			}

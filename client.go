@@ -637,7 +637,7 @@ func botConf(cate string) (conf telegram.ClientConfig) {
 }
 
 // list
-func (infos *Infos) list(channel string, page, limit int, filter int64) (items Items, err error) {
+func (infos *Infos) list(channel string, page, limit int, filter int64, reverse bool) (items Items, err error) {
 	if waitUntil := infos.WaitUntil.Load(); waitUntil > 0 {
 		if remaining := time.Until(time.Unix(waitUntil, 0)); remaining > 0 {
 			log.Printf("列表: 检测到FloodWait, 等待 %.2f 秒", remaining.Seconds())
@@ -674,15 +674,15 @@ func (infos *Infos) list(channel string, page, limit int, filter int64) (items I
 	if len(ms) == limit {
 		handleOffset("set", fmt.Sprintf("%s|%d", channel, page+1), ms[len(ms)-1].ID)
 	}
-
-	slices.Reverse(ms)
-	for _, m := range ms {
+	if reverse {
+		slices.Reverse(ms)
+	}
+	for num, m := range ms {
 		if m.File == nil {
 			continue
 		}
 
-		size := m.File.Size
-		if IsVideoFile(m.File.Ext) && size < filter {
+		if IsVideoFile(m.File.Ext) && m.File.Size < filter {
 			continue
 		}
 
@@ -690,22 +690,21 @@ func (infos *Infos) list(channel string, page, limit int, filter int64) (items I
 			items.Channel = strings.TrimSpace(m.Channel.Title)
 		}
 
-		src := strings.TrimSpace(m.Text())
-		src = strings.ReplaceAll(src, "_", "")
-		src = strings.Join(strings.Fields(src), " ")
-		name := strings.TrimSpace(m.File.Name)
-		name = strings.ReplaceAll(name, "_", "")
-		name = strings.Join(strings.Fields(name), " ")
-
-		items.Item = append(items.Item, Item{
-			Ext:  m.File.Ext,
-			Src:  src,
-			Name: name,
-			Size: size,
-			CID:  m.Channel.ID,
-			MID:  m.ID,
-		})
+		if num == 0 {
+			medias, err := m.GetMediaGroup()
+			if err != nil {
+				log.Printf("提取媒体组错误: %+v", err)
+			}
+			for _, media := range medias {
+				item := handleItem(media)
+				items.Item = append(items.Item, item)
+			}
+		} else {
+			item := handleItem(m)
+			items.Item = append(items.Item, item)
+		}
 	}
+
 	if len(items.Item) > 0 {
 		items.HasMore = true
 		items.ID = channel
@@ -714,7 +713,7 @@ func (infos *Infos) list(channel string, page, limit int, filter int64) (items I
 }
 
 // search 在指定频道中搜索关键词并返回匹配的媒体文件列表
-func (infos *Infos) search(channel, keywords string, page, limit int, offset int32, filter int64) (items Items, err error) {
+func (infos *Infos) search(channel, keywords string, page, limit int, offset int32, filter int64, reverse bool) (items Items, err error) {
 	if waitUntil := infos.WaitUntil.Load(); waitUntil > 0 {
 		if remaining := time.Until(time.Unix(waitUntil, 0)); remaining > 0 {
 			log.Printf("搜索: 检测到FloodWait, 等待 %.2f 秒", remaining.Seconds())
@@ -754,7 +753,9 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 		handleOffset("set", key, ms[len(ms)-1].ID)
 	}
 
-	slices.Reverse(ms)
+	if reverse {
+		slices.Reverse(ms)
+	}
 	maxCount := 3
 	rids := make(map[int64]bool)
 	mids := make([]int32, 0, len(ms)*maxCount)
@@ -814,21 +815,7 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 				items.Channel = strings.TrimSpace(m.Channel.Title)
 			}
 
-			src := strings.TrimSpace(m.Text())
-			src = strings.ReplaceAll(src, "_", "")
-			src = strings.Join(strings.Fields(src), " ")
-			name := strings.TrimSpace(m.File.Name)
-			name = strings.ReplaceAll(name, "_", "")
-			name = strings.Join(strings.Fields(name), " ")
-
-			items.Item = append(items.Item, Item{
-				Ext:  m.File.Ext,
-				Src:  src,
-				Name: name,
-				Size: size,
-				CID:  m.Channel.ID,
-				MID:  m.ID,
-			})
+			items.Item = append(items.Item, handleItem(m))
 		}
 	}
 	if len(items.Item) > 0 {
@@ -841,70 +828,55 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 
 // selectClient 根据当前网络延迟选择最佳客户端
 func (infos *Infos) handleMs(cid int64, mid int32, cate string) (result string, src telegram.NewMessage, err error) {
-	// 3. 选择下载客户端 (Bot 或 UserBot)
+	var wakeTime time.Time
+
+	// 1. 选择下载客户端，并提取对应的唤醒时间
 	if cate == "user" && infos.Status.Load() == 3 {
 		infos.Client = infos.UserClient
+		wakeTime = infos.TCPStatus.User.WakeTime
 	} else {
 		cate = "bot"
 		infos.Client = infos.BotClient
+		wakeTime = infos.TCPStatus.Bot.WakeTime
 	}
 	result = cate
 
-	switch cate {
-	case "user":
-		if time.Since(infos.TCPStatus.User.WakeTime).Minutes() > 30 {
-			if err := infos.wakeTCP(cate); err != nil {
-				log.Printf("唤醒 TCP 连接失败: %+v", err)
-			}
-		} else {
-			if infos.Conf.DeBUG {
-				diff := time.Since(infos.TCPStatus.User.WakeTime)
-				minutes := int(diff.Minutes())
-				seconds := int(diff.Seconds()) % 60
-				if minutes != 0 {
-					src := fmt.Sprintf("%02d分%02d秒", minutes, seconds)
-					src = strings.TrimPrefix(src, "0")
-					log.Printf("TCP 链路正常, %s前唤醒", src)
-				} else {
-					log.Printf("TCP 链路正常, %d秒前唤醒", seconds)
-				}
-			}
+	// 2. 统一处理 TCP 链路检查与唤醒逻辑（彻底去除了重复代码）
+	if time.Since(wakeTime).Minutes() > 30 {
+		if err = infos.wakeTCP(cate); err != nil {
+			log.Printf("唤醒 TCP 连接失败: %+v", err)
+			return "", telegram.NewMessage{}, err // 📌 隐患 1 修复：建议失败时直接中断返回
 		}
-	case "bot":
-		if time.Since(infos.TCPStatus.Bot.WakeTime).Minutes() > 30 {
-			if err := infos.wakeTCP(cate); err != nil {
-				log.Printf("唤醒 TCP 连接失败: %+v", err)
-			}
+	} else if infos.Conf.DeBUG {
+		diff := time.Since(wakeTime)
+		minutes := int(diff.Minutes())
+		seconds := int(diff.Seconds()) % 60
+		if minutes != 0 {
+			// 📌 隐患 2 修复：将原 src 改为 timeStr，避免变量遮蔽
+			timeStr := fmt.Sprintf("%02d分%02d秒", minutes, seconds)
+			timeStr = strings.TrimPrefix(timeStr, "0")
+			log.Printf("TCP 链路正常, %s前唤醒", timeStr)
 		} else {
-			if infos.Conf.DeBUG {
-				diff := time.Since(infos.TCPStatus.Bot.WakeTime)
-				minutes := int(diff.Minutes())
-				seconds := int(diff.Seconds()) % 60
-				if minutes != 0 {
-					src := fmt.Sprintf("%02d分%02d秒", minutes, seconds)
-					src = strings.TrimPrefix(src, "0")
-					log.Printf("TCP 链路正常, %s前唤醒", src)
-				} else {
-					log.Printf("TCP 链路正常, %d秒前唤醒", seconds)
-				}
-			}
+			log.Printf("TCP 链路正常, %d秒前唤醒", seconds)
 		}
 	}
 
+	// 3. 获取消息
 	ms, err := infos.Client.GetMessages(cid, &telegram.SearchOption{IDs: []int32{mid}})
 	if err != nil || len(ms) == 0 {
 		err = fmt.Errorf("获取消息失败: cid=%d, mid=%d, err=%v, count=%d", cid, mid, err, len(ms))
 		log.Print(err.Error())
-		return
+		return result, telegram.NewMessage{}, err
 	}
 
 	src = ms[0]
 	if !src.IsMedia() {
 		err = fmt.Errorf("消息不包含媒体: cid=%d, mid=%d", cid, mid)
 		log.Print(err.Error())
-		return
+		return result, telegram.NewMessage{}, err
 	}
-	return
+
+	return result, src, nil
 }
 
 // handleChannel 处理频道ID, 返回 InputPeer
@@ -923,4 +895,25 @@ func (infos *Infos) handleChannel(channel string) (result telegram.InputPeer, er
 		infos.Mutex.Unlock()
 	}
 	return result, nil
+}
+
+// handleItem 处理消息媒体, 返回 Item
+func handleItem(m telegram.NewMessage) (item Item) {
+	src := strings.TrimSpace(m.Text())
+	src = strings.ReplaceAll(src, "_", "")
+	src = strings.Join(strings.Fields(src), " ")
+	name := strings.TrimSpace(m.File.Name)
+	name = strings.ReplaceAll(name, "_", "")
+	name = strings.Join(strings.Fields(name), " ")
+
+	item.Ext = m.File.Ext
+	item.Src = src
+	item.Name = name
+	item.Size = m.File.Size
+	item.CID = m.Channel.ID
+	item.MID = m.ID
+	if m.Message != nil {
+		item.GID = m.Message.GroupedID
+	}
+	return item
 }

@@ -28,6 +28,7 @@ type Params struct {
 	MID      int32
 	Page     int
 	Limit    int
+	Reverse  bool
 	Cate     string
 	Keywords string
 	Channels []string
@@ -67,6 +68,7 @@ type Item struct {
 	Name string `json:"name"`
 	MID  int32  `json:"mid"`
 	CID  int64  `json:"cid"`
+	GID  int64  `json:"gid"`
 	Size int64  `json:"size"`
 }
 

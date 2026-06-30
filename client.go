@@ -696,6 +696,9 @@ func (infos *Infos) list(channel string, page, limit int, filter int64, reverse 
 				log.Printf("提取媒体组错误: %+v", err)
 			}
 			for _, media := range medias {
+				if IsVideoFile(media.File.Ext) && media.File.Size < filter {
+					continue
+				}
 				item := handleItem(media)
 				items.Item = append(items.Item, item)
 			}
@@ -806,8 +809,8 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 					continue
 				}
 			}
-			size := m.File.Size
-			if IsVideoFile(m.File.Ext) && size < filter {
+
+			if IsVideoFile(m.File.Ext) && m.File.Size < filter {
 				continue
 			}
 

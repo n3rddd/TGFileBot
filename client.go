@@ -689,14 +689,15 @@ func (infos *Infos) list(channel string, page, limit int, filter int64) (items I
 			items.Channel = strings.TrimSpace(m.Channel.Title)
 		}
 
-		name := strings.TrimSpace(m.Text())
-		if name == "" {
-			name = strings.TrimSpace(m.File.Name)
-		}
+		src := strings.TrimSpace(m.Text())
+		src = strings.ReplaceAll(src, "_", "")
+		src = strings.Join(strings.Fields(src), " ")
+		name := strings.TrimSpace(m.File.Name)
 		name = strings.ReplaceAll(name, "_", "")
 		name = strings.Join(strings.Fields(name), " ")
 
 		items.Item = append(items.Item, Item{
+			Src:  src,
 			Name: name,
 			Size: size,
 			CID:  m.Channel.ID,
@@ -811,16 +812,17 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 				items.Channel = strings.TrimSpace(m.Channel.Title)
 			}
 
-			name := strings.TrimSpace(m.Text())
-			if name == "" {
-				name = strings.TrimSpace(m.File.Name)
-			}
+			src := strings.TrimSpace(m.Text())
+			src = strings.ReplaceAll(src, "_", "")
+			src = strings.Join(strings.Fields(src), " ")
+			name := strings.TrimSpace(m.File.Name)
 			name = strings.ReplaceAll(name, "_", "")
 			name = strings.Join(strings.Fields(name), " ")
 
 			items.Item = append(items.Item, Item{
+				Src:  src,
 				Name: name,
-				Size: m.File.Size,
+				Size: size,
 				CID:  m.Channel.ID,
 				MID:  m.ID,
 			})

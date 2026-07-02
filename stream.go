@@ -375,7 +375,12 @@ func (stream *Stream) clean() {
 		waiter.Stop()
 		// 等待所有 download 协程退出后再操作 Pools，消除与 handlePool 写入的数据竞争
 		// Count 由各协程自己递减（defer stream.Count.Add(-1)），此处轮询直到归零
+		deadline := time.Now().Add(30 * time.Second)
 		for stream.Count.Load() > 0 {
+			if time.Now().After(deadline) {
+				log.Printf("等待协程超时, 强制退出")
+				break
+			}
 			time.Sleep(10 * time.Millisecond)
 		}
 		// 关闭所有工作协程的连接池（仅 drain channel，不终止底层 TCP）

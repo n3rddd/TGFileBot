@@ -481,7 +481,8 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		// 启动并发下载协程
 		go stream.start(start, end)
 		defer func() {
-			stream.clean()
+			// 异步清理：不阻塞当前请求 goroutine 返回，使新请求能立即被处理
+			go stream.clean()
 			switch cate {
 			case "user":
 				infos.TCPStatus.User.WakeTime = time.Now()

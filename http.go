@@ -219,11 +219,15 @@ func handlePic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	param := &telegram.SearchOption{
-		Context: r.Context(),
-		IDs:     []int32{params.MID},
+	param := HandleMs{
+		CID:   params.CID,
+		MIDs:  []int32{params.MID},
+		Ctx:   r.Context(),
+		Cate:  params.Cate,
+		Limit: 1,
 	}
-	cate, ms, err := infos.handleMs(params.CID, params.MID, params.Cate, "", param)
+
+	cate, ms, err := infos.handleMs(param)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -331,7 +335,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 	items.Items = make([]Items, 0, len(params.Channels))
 
 	for _, channel := range params.Channels {
-		item, err := infos.list(channel, params.Page, params.Limit, params.Filter, params.Reverse, r.Context())
+		item, err := infos.list(channel, params.Page, params.Limit, params.Offset, params.Filter, params.Reverse, r.Context())
 		if err != nil {
 			log.Printf("获取频道 %s 的文件列表失败: %+v", channel, err)
 			continue
@@ -356,7 +360,9 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 // handleLink 处理链接提取请求, 将 Telegram 消息链接转换为直链下载地址并执行重定向
 func handleLink(w http.ResponseWriter, r *http.Request) {
-	res := HackLink{}
+	res := HackLink{
+		Ctx: r.Context(),
+	}
 	params, err := handleParams(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -421,11 +427,15 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	param := &telegram.SearchOption{
-		Context: r.Context(),
-		IDs:     []int32{params.MID},
+	param := HandleMs{
+		CID:   params.CID,
+		MIDs:  []int32{params.MID},
+		Ctx:   r.Context(),
+		Cate:  params.Cate,
+		Limit: 1,
 	}
-	cate, ms, err := infos.handleMs(params.CID, params.MID, params.Cate, "", param)
+
+	cate, ms, err := infos.handleMs(param)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -607,11 +617,15 @@ func handleSources(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	param := &telegram.SearchOption{
-		Context: r.Context(),
-		IDs:     []int32{params.MID},
+	param := HandleMs{
+		CID:   params.CID,
+		MIDs:  []int32{params.MID},
+		Ctx:   r.Context(),
+		Cate:  params.Cate,
+		Limit: params.Limit,
 	}
-	_, resources, err := infos.handleMs(params.CID, params.MID, params.Cate, "", param)
+
+	_, resources, err := infos.handleMs(param)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -633,10 +647,6 @@ func handleSources(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if params.Reverse {
-		slices.Reverse(ms)
-	}
-
 	items := Items{
 		Channel: strings.TrimSpace(src.Channel.Title),
 		ID:      src.Channel.Username,
@@ -650,6 +660,7 @@ func handleSources(w http.ResponseWriter, r *http.Request) {
 		item := handleItem(m)
 		items.Item = append(items.Item, item)
 	}
+	sortItems(items.Item, params.Reverse)
 
 	content, err := json.Marshal(items)
 	if err != nil {
@@ -829,8 +840,15 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	param := &telegram.SearchOption{IDs: []int32{params.MID}}
-	_, ms, err := infos.handleMs(params.CID, params.MID, "user", "", param)
+	param := HandleMs{
+		CID:   params.CID,
+		MIDs:  []int32{params.MID},
+		Ctx:   r.Context(),
+		Cate:  "user",
+		Limit: params.Limit,
+	}
+
+	_, ms, err := infos.handleMs(param)
 	if err != nil || len(ms) == 0 {
 		if len(ms) == 0 {
 			err = errors.New("未获取到消息")
@@ -838,7 +856,7 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	if err := infos.handleComments(params.MID, params.Offset, &ms, true); err != nil {
+	if err := infos.handleComments(params.MID, params.Offset, &ms); err != nil {
 		http.Error(w, "获取评论失败", http.StatusInternalServerError)
 		return
 	}
@@ -864,6 +882,7 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 		item := handleItem(m)
 		items.Item = append(items.Item, item)
 	}
+	sortItems(items.Item, params.Reverse)
 	result.Items = append(result.Items, items)
 
 	content, err := json.Marshal(result)
@@ -951,8 +970,14 @@ func hackLinks(res HackLink) (links []string) {
 		mid = int32(value)
 
 		// 3. 使用 UserBot 客户端尝试获取目标消息
-		param := &telegram.SearchOption{IDs: []int32{mid}}
-		_, ms, err := infos.handleMs(cid, mid, "user", "", param)
+		param := HandleMs{
+			CID:   cid,
+			MIDs:  []int32{mid},
+			Ctx:   res.Ctx,
+			Cate:  "user",
+			Limit: 1,
+		}
+		_, ms, err := infos.handleMs(param)
 		if err != nil || len(ms) == 0 {
 			log.Printf("获取消息失败: cid=%v, mid=%d, err=%v, count=%d", cid, mid, err, len(ms))
 			if len(ms) == 0 {
@@ -964,7 +989,7 @@ func hackLinks(res HackLink) (links []string) {
 
 		// 4. 处理链接中的评论 (comment) 逻辑
 		if match[5] != "" {
-			if err := infos.handleComments(mid, res.Offset, &ms, true); err != nil {
+			if err := infos.handleComments(mid, res.Offset, &ms); err != nil {
 				log.Printf("获取评论失败: cid=%v, mid=%d, err=%+v", cid, mid, err)
 				errs = errors.Join(errs, err)
 				continue

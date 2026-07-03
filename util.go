@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -345,3 +346,13 @@ func handleOffset(act, kname string, value int32) (offset int32) {
 	return
 }
 
+func sortItems(items []Item, reverse bool) {
+	sort.Slice(items, func(a, b int) bool {
+		if reverse {
+			// true 时从小到大
+			return items[a].MID < items[b].MID
+		}
+		// false 时从大到小
+		return items[a].MID > items[b].MID
+	})
+}

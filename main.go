@@ -48,11 +48,23 @@ type ChannelInfo struct {
 // HackLink 结构体用于在处理提取链接时传递中间数据
 type HackLink struct {
 	M       *telegram.NewMessage // 原始消息对象
+	Ctx     context.Context      // 上下文
 	Offset  int32                // 偏移量
 	UID     int64                // 发起请求的用户 ID
 	Pass    string               // 可选密码
 	Hash    string               // 验证哈希
 	Matches [][]string           // 正则匹配到的链接信息
+}
+
+type HandleMs struct {
+	CID      int64
+	OffsetID int32
+	Limit    int
+	MIDs     []int32
+	Cate     string
+	Words    string
+	Ctx      context.Context
+	Filter   telegram.MessagesFilter
 }
 
 // CleanRealm 结构体用于定义清理缓存和会话的范围

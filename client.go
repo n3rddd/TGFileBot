@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -637,27 +636,31 @@ func botConf(cate string) (conf telegram.ClientConfig) {
 }
 
 // list
-func (infos *Infos) list(channel string, page, limit int, filter int64, reverse bool, ctx context.Context) (items Items, err error) {
+func (infos *Infos) list(channel string, page, limit int, offset int32, filter int64, reverse bool, ctx context.Context) (items Items, err error) {
 	channelInfo, err := infos.handleChannel(channel)
 	if err != nil {
 		return items, err
 	}
 	if page == 1 {
 		handleOffset("del", channel, 0)
+	} else {
+		offset = handleOffset("get", fmt.Sprintf("%s|%d", channel, page), 0)
 	}
 
-	offset := handleOffset("get", fmt.Sprintf("%s|%d", channel, page), 0)
 	if page > 1 && offset == 0 {
 		return items, errors.New("未找到匹配消息")
 	}
-	param := &telegram.SearchOption{
-		Limit:   int32(limit),
-		Offset:  offset,
-		Context: ctx,
-		Filter:  &telegram.InputMessagesFilterPhotoVideo{},
+
+	params := HandleMs{
+		CID:      channelInfo.CID,
+		OffsetID: offset,
+		Limit:    limit,
+		Filter:   &telegram.InputMessagesFilterPhotoVideo{},
+		Ctx:      ctx,
+		Cate:     "user",
 	}
 
-	_, ms, err := infos.handleMs(channelInfo.CID, offset, "user", "", param)
+	_, ms, err := infos.handleMs(params)
 	if err != nil {
 		return items, err
 	}
@@ -710,6 +713,9 @@ func (infos *Infos) list(channel string, page, limit int, filter int64, reverse 
 				if IsVideoFile(media.File.Ext) && media.File.Size < filter {
 					continue
 				}
+				if value, ok := mids[media.ID]; ok && value {
+					continue
+				}
 
 				sid := strconv.FormatInt(int64(media.ID), 10)
 				if strings.Contains(latestID, sid) {
@@ -729,15 +735,13 @@ func (infos *Infos) list(channel string, page, limit int, filter int64, reverse 
 				infos.Mutex.Unlock()
 			}
 		} else {
+			mids[m.ID] = true
 			item := handleItem(m)
 			items.Item = append(items.Item, item)
 		}
 	}
 
-	if reverse {
-		slices.Reverse(items.Item)
-	}
-
+	sortItems(items.Item, reverse)
 	items.ID = channel
 	return items, nil
 }
@@ -757,15 +761,17 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 		}
 	}
 
-	param := &telegram.SearchOption{
-		Query:   keywords,
-		Limit:   int32(limit),
-		Offset:  offset,
-		Context: ctx,
-		Filter:  &telegram.InputMessagesFilterPhotoVideo{},
+	params := HandleMs{
+		CID:      channelInfo.CID,
+		OffsetID: offset,
+		Limit:    limit,
+		Filter:   &telegram.InputMessagesFilterPhotoVideo{},
+		Ctx:      ctx,
+		Words:    keywords,
+		Cate:     "user",
 	}
 
-	_, ms, err := infos.handleMs(channelInfo.CID, offset, "user", keywords, param)
+	_, ms, err := infos.handleMs(params)
 	if err != nil {
 		return items, err
 	}
@@ -796,30 +802,28 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 	}
 	items.ID = channel
 	items.Word = keywords
-	if reverse {
-		slices.Reverse(items.Item)
-	}
+	sortItems(items.Item, reverse)
 	return items, nil
 }
 
 // selectClient 根据当前网络延迟选择最佳客户端
-func (infos *Infos) handleMs(cid int64, mid int32, cate, words string, params *telegram.SearchOption) (result string, ms []telegram.NewMessage, err error) {
+func (infos *Infos) handleMs(params HandleMs) (result string, ms []telegram.NewMessage, err error) {
 	var wakeTime time.Time
 
 	// 1. 选择下载客户端，并提取对应的唤醒时间
-	if cate == "user" && infos.Status.Load() == 3 {
+	if params.Cate == "user" && infos.Status.Load() == 3 {
 		infos.Client = infos.UserClient
 		wakeTime = infos.TCPStatus.User.WakeTime
 	} else {
-		cate = "bot"
+		params.Cate = "bot"
 		infos.Client = infos.BotClient
 		wakeTime = infos.TCPStatus.Bot.WakeTime
 	}
-	result = cate
+	result = params.Cate
 
 	// 2. 统一处理 TCP 链路检查与唤醒逻辑（彻底去除了重复代码）
 	if time.Since(wakeTime).Minutes() > 30 {
-		if err = infos.wakeTCP(cate); err != nil {
+		if err = infos.wakeTCP(params.Cate); err != nil {
 			log.Printf("唤醒 TCP 连接失败: %+v", err)
 			return "", []telegram.NewMessage{}, err
 		}
@@ -837,41 +841,56 @@ func (infos *Infos) handleMs(cid int64, mid int32, cate, words string, params *t
 	}
 
 	// 3. 获取消息
-	kname := cate + ":" + strconv.FormatInt(cid, 10)
-	if mid != 0 {
+	if params.Limit == 0 {
+		params.Limit = 100
+	}
+	kname := params.Cate
+	if params.Words != "" {
+		kname += ":" + params.Words
+	}
+
+	kname += ":" + strconv.FormatInt(params.CID, 10)
+	for _, mid := range params.MIDs {
 		kname += ":" + strconv.FormatInt(int64(mid), 10)
 	}
-	if words != "" {
-		kname += ":" + words
+
+	lenMIDs := len(params.MIDs)
+	if lenMIDs > 0 && params.Limit > lenMIDs {
+		params.Limit = lenMIDs
+	}
+
+	if params.OffsetID > 0 {
+		kname += "-" + strconv.FormatInt(int64(params.OffsetID-1), 10)
 	}
 
 	infos.Mutex.RLock()
 	value, ok := infos.MsCache[kname]
 	infos.Mutex.RUnlock()
-	if ok {
+		
+	if ok && value.Mes != nil && len(value.Mes) >= params.Limit {
 		if infos.Conf.DeBUG {
 			log.Printf("命中消息缓存: %s", kname)
 		}
 		ms = value.Mes
 		value.Time = time.Now()
 	} else {
-		ms, err = infos.Client.GetMessages(cid, params)
+		param := &telegram.SearchOption{
+			IDs:     params.MIDs,
+			Limit:   int32(params.Limit),
+			Offset:  params.OffsetID,
+			Context: params.Ctx,
+			Filter:  params.Filter,
+		}
+		ms, err = infos.Client.GetMessages(params.CID, param)
 		if err != nil || len(ms) == 0 {
 			if len(ms) == 0 {
 				err = errors.New("未获取到消息")
 			}
-			err = fmt.Errorf("获取消息失败: cid=%v, mid=%d, err=%v, count=%d", cid, mid, err, len(ms))
+			err = fmt.Errorf("获取消息失败: cid=%v, mids=%v, count=%d, err=%+v", params.CID, params.MIDs, len(ms), err)
 			log.Print(err.Error())
 			return result, []telegram.NewMessage{}, err
 		}
-		hasMedia := false
-		for _, m := range ms {
-			if m.IsMedia() {
-				hasMedia = true
-				break
-			}
-		}
-		if hasMedia {
+		if len(ms) == params.Limit {
 			infos.Mutex.Lock()
 			evictOldestMsCache(infos.MsCache, infos.MaxMs)
 			infos.MsCache[kname] = &MsCache{Mes: ms, Time: time.Now()}
@@ -957,7 +976,7 @@ func (infos *Infos) handleChannel(channel string, hash ...int64) (result Channel
 }
 
 // handleComments 处理评论消息，返回评论消息列表
-func (infos *Infos) handleComments(mid, offset int32, ms *[]telegram.NewMessage, reverse bool) error {
+func (infos *Infos) handleComments(mid, offset int32, ms *[]telegram.NewMessage) error {
 	if len(*ms) == 0 {
 		return errors.New("未找到消息")
 	}
@@ -1013,9 +1032,6 @@ func (infos *Infos) handleComments(mid, offset int32, ms *[]telegram.NewMessage,
 			}
 			nm.Chat.ID = discussionID
 			*ms = append(*ms, *nm)
-		}
-		if reverse {
-			slices.Reverse(*ms)
 		}
 	}
 	return nil

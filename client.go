@@ -820,14 +820,17 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 // handleMs 根据当前网络延迟选择最佳客户端
 func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 	var wakeTime time.Time
+	var latenc int64
 
 	// 1. 选择下载客户端，并提取对应的唤醒时间
 	if params.Cate == "user" && infos.Status.Load() == 3 {
 		infos.Client = infos.UserClient
+		latenc = infos.TCPStatus.User.Latenc
 		wakeTime = infos.TCPStatus.User.WakeTime
 	} else {
 		params.Cate = "bot"
 		infos.Client = infos.BotClient
+		latenc = infos.TCPStatus.Bot.Latenc
 		wakeTime = infos.TCPStatus.Bot.WakeTime
 	}
 
@@ -844,9 +847,9 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 		if minutes != 0 {
 			timeStr := fmt.Sprintf("%02d分%02d秒", minutes, seconds)
 			timeStr = strings.TrimPrefix(timeStr, "0")
-			log.Printf("TCP 链路正常, %s前唤醒", timeStr)
+			log.Printf("TCP 链路正常, %s前唤醒, 延迟: %d毫秒", timeStr, latenc)
 		} else {
-			log.Printf("TCP 链路正常, %d秒前唤醒", seconds)
+			log.Printf("TCP 链路正常, %d秒前唤醒, 延迟: %d毫秒", seconds, latenc)
 		}
 	}
 
@@ -857,18 +860,30 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 
 	kname := params.Cate
 
-	if params.Words != "" {
-		kname += ":" + params.Words
-	}
+	cidStr := strconv.FormatInt(params.CID, 10)
+	src := "cid=" + cidStr
+	kname += ":" + cidStr
 
-	kname += ":" + strconv.FormatInt(params.CID, 10)
-
-	for _, mid := range params.MIDs {
-		kname += ":" + strconv.FormatInt(int64(mid), 10)
+	if len(params.MIDs) > 0 {
+		src += ", mids=["
+		for _, mid := range params.MIDs {
+			midStr := strconv.FormatInt(int64(mid), 10)
+			src += midStr + ", "
+			kname += ":" + midStr
+		}
+		src = strings.TrimRight(src, ", ")
+		src += "]"
 	}
 
 	if params.OffsetID > 0 {
-		kname += ":" + strconv.FormatInt(int64(params.OffsetID-1), 10)
+		offsetIDStr := strconv.FormatInt(int64(params.OffsetID-1), 10)
+		src += ", offset=" + offsetIDStr
+		kname += ":" + offsetIDStr
+	}
+
+	if params.Words != "" {
+		src += ", keywords=" + params.Words
+		kname += ":" + params.Words
 	}
 
 	lenMIDs := len(params.MIDs)
@@ -895,12 +910,15 @@ func (infos *Infos) handleMs(params HandleMs) (result *MsCache, err error) {
 			Filter:  params.Filter,
 		}
 		ms, err := infos.Client.GetMessages(params.CID, param)
-		if err != nil || len(ms) == 0 {
-			if len(ms) == 0 {
-				err = errors.New("未获取到消息")
+		if err != nil {
+			return result, err
+		}
+
+		if len(ms) == 0 {
+			err = errors.New("未获取到消息")
+			if infos.Conf.DeBUG {
+				log.Printf("获取消息失败: %s, count=%d, err=%+v", src, len(ms), err)
 			}
-			err = fmt.Errorf("获取消息失败: cid=%v, mids=%v, count=%d, err=%+v", params.CID, params.MIDs, len(ms), err)
-			log.Print(err.Error())
 			return result, err
 		}
 		result = &MsCache{Mes: ms, Time: time.Now(), Cate: params.Cate}

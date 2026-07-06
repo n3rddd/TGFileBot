@@ -276,13 +276,14 @@ docker stop tgfilebot
 
 **URL 格式**:
 ```
-/list?cname={频道别名}&page={页码}&limit={每页数量}&filter={过滤大小}&key={key}
+/list?cname={频道别名}&page={页码}&limit={每页数量}&offset={偏移ID}&filter={过滤大小}&key={key}
 ```
 
 | 参数 | 必填 | 说明 |
 |:---|:---:|:---|
 | `cname` | 是 | 频道别名/用户名（例如 `@channelname` 或 `channelname`） |
 | `page` | 否 | 页码，默认 `1` |
+| `offset` | 否 | 结果偏移ID，用于翻页，默认 `0` |
 | `limit` | 否 | 每页返回数量，默认 `20`，最大 `100` |
 | `filter` | 否 | 过滤文件大小，如 `10M`，仅返回大于此大小的文件，默认 `128K` |
 | `reverse` | 否 | 是否反序排列，默认 `false` |
@@ -734,7 +735,7 @@ hash_val = hashlib.md5(f"{uid}{password}".encode()).hexdigest()[:6]
 
 ## 更新日志
 
-### v1.1.2 (当前版本)
+### v1.1.3 (当前版本)
 - ✅ 增强并发下载稳定性
 - ✅ 优化缓存管理策略
 - ✅ 改进错误处理和日志记录
@@ -770,7 +771,7 @@ A: 支持，需要 UserBot 已登录，设置 `cate=user` 参数。
 A: 不会，程序仅负责流式转发，不存储任何下载内容。
 
 **Q: 如何监控程序状态？**  
-A: 访问 `GET /` 端点，或查看日志文件 `files/log.log`。
+A: 访问 `GET /` 端点、查看日志文件 `files/log.log`，或以管理员及以上身份在机器人对话中使用 `/info` 命令查看是指。
 
 ---
 

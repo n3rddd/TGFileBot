@@ -51,7 +51,6 @@ jobs:
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-amd64
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-linux-arm64
           GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -tags netgo -installsuffix netgo -o TGFileBot-freebsd-amd64
-          echo "DIR_NAME=$PWD" >> $GITHUB_ENV
           echo ${{ steps.bump.outputs.new_tag }} >> TGFileBot-version
 
       - name: Upload Go to Release
@@ -60,7 +59,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.bump.outputs.new_tag }}
-          files: ${{ env.DIR_NAME }}/TGFileBot-*
+          files: ${{ github.workspace }}/TGFileBot-*
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

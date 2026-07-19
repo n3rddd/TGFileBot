@@ -1135,30 +1135,51 @@ func (infos *Infos) handleComments(mid, offset int32, page, limit int, ms *[]tel
 			return false, err
 		}
 
-		// 从 MessagesGetReplies 的结果中提取原始消息列表
+		// 从 MessagesGetReplies 的结果中提取原始消息列表和随附的 Chats。
+		// Chats 里带有讨论组的完整 AccessHash——必须在 PackMessages 之前注册进客户端缓存，
+		// 否则 packMessage 内部按 PeerID 反查频道时缓存未命中，只能用 access_hash=0 现猜，
+		// 导致除第一条(种子消息本身、频道信息天然已缓存)外的评论消息 Channel 解析失败/错误，
+		// 使得 item.CID 缺失或不正确，播放时后端按 cid+mid 找不到对应媒体。
 		var newMs []telegram.Message
+		var chats []telegram.Chat
 		switch v := results.(type) {
 		case *telegram.MessagesMessagesSlice:
-			newMs = v.Messages
+			newMs, chats = v.Messages, v.Chats
 		case *telegram.MessagesChannelMessages:
-			newMs = v.Messages
+			newMs, chats = v.Messages, v.Chats
 		case *telegram.MessagesMessagesObj:
-			newMs = v.Messages
+			newMs, chats = v.Messages, v.Chats
 		default:
 			log.Printf("收到未知的底层具体类型: %T, %v", v, v)
+		}
+
+		var discussionChannel *telegram.Channel
+		for _, ch := range chats {
+			if channel, ok := ch.(*telegram.Channel); ok {
+				infos.UserClient.Load().Cache.UpdateChannel(channel)
+				if channel.ID == discussionID {
+					discussionChannel = channel
+				}
+			}
 		}
 
 		// 拉到的原始评论数达到 limit, 说明 Telegram 一侧大概率还有更多未拉取的评论
 		hasMore = len(newMs) >= limit
 
-		// PackMessages 将 []telegram.Message 转为 []*telegram.NewMessage，
-		// 然后按 commentIDSet 过滤，设置 Chat.ID 后追加到 ms
+		// PackMessages 将 []telegram.Message 转为 []*telegram.NewMessage；
+		// 上面已注册频道缓存，这里再兜底纠正一次 Channel(此前误写为 Chat.ID，对 item.CID 无效果)
 		startLen := len(*ms)
 		for _, nm := range telegram.PackMessages(infos.UserClient.Load(), newMs) {
 			if !nm.IsMedia() {
 				continue
 			}
-			nm.Chat.ID = discussionID
+			if nm.Channel == nil || nm.Channel.ID != discussionID {
+				if discussionChannel != nil {
+					nm.Channel = discussionChannel
+				} else if nm.Channel != nil {
+					nm.Channel.ID = discussionID
+				}
+			}
 			*ms = append(*ms, *nm)
 		}
 
